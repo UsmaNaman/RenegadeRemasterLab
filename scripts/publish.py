@@ -17,9 +17,15 @@ RELEASE = "refs/heads/release"
 
 
 def git(*args: str, data: str | None = None) -> str:
-    return subprocess.check_output(
-        ["git", "--no-optional-locks", "--no-replace-objects", *args], input=data, text=True
-    ).strip()
+    # Bytes, not text mode: Windows would turn stdin's \n into \r\n, which mktag rejects.
+    return (
+        subprocess.check_output(
+            ["git", "--no-optional-locks", "--no-replace-objects", *args],
+            input=None if data is None else data.encode(),
+        )
+        .decode()
+        .strip()
+    )
 
 
 def publish(args: argparse.Namespace, scratch: Path) -> None:

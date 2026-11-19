@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/publish.py` failed on Windows: text-mode stdin turned tag data line endings into CRLF.
+
 ## [0.1.0a2] - 2026-11-19
 
 ### Added

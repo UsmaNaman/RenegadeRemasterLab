@@ -1,0 +1,28 @@
+From ba78a7ababab5b7e3a575a6bb3b103433795e28b Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:56:02 +0000
+Subject: [PATCH] nv2a/vk: map border 0x00ffffff to opaque white on MoltenVK
+
+Without VK_EXT_custom_border_color the alpha-first rule turned transparent
+white into transparent black, drawing square patches under Halo 2's projected
+character shadows. Replaces the XEMU_BORDER_WHITE_TEST experiment.
+---
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index 72a5e5c..b6c0ce1 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -1576,7 +1576,13 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+             uint32_t rgb = border_color_pack32 & 0xffffff;
+             uint32_t luma = ((rgb >> 16 & 0xff) + (rgb >> 8 & 0xff) +
+                              (rgb & 0xff)) / 3;
+-            if (a < 0x80) {
++            /* Transparent white is a neutral border for colour-only passes
++             * (Halo 2's projected character shadows draw square patches as
++             * transparent black). shortcut: alpha is wrong for passes that
++             * read it; emulate the border in the shader to fix both. */
++            if (border_color_pack32 == 0x00ffffff) {
++                vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
++            } else if (a < 0x80) {
+                 vk_border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+             } else if (luma < 0x80) {
+                 vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;

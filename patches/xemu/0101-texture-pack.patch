@@ -1,0 +1,400 @@
+From 829ea6de559ea9ed51d9fba5fa248982ca50c2ee Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:14:23 +0000
+Subject: [PATCH] nv2a/vk: replace guest textures from an RRL texture pack
+
+When XEMU_TEXTURE_PACK_DIR is set, a non-linear, non-indexed 2D texture
+whose content hash has <hash>.rgba in that directory is created from the
+file instead: "RRT1", LE u32 width/height/levels, then RGBA8 levels. The
+size must be the guest size times a power of two; sampler min/max LOD
+are shifted by that power so the game's mip clamps still apply. A
+replaced binding whose content changes is rebuilt, since its image size
+and format differ from the guest shape. The staging-to-image copy is
+split out of upload_texture_image so both paths share it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZfY8PfkRfJCjArnYegSSy
+---
+ hw/xbox/nv2a/pgraph/vk/renderer.h |   1 +
+ hw/xbox/nv2a/pgraph/vk/texture.c  | 279 +++++++++++++++++++++++++-----
+ 2 files changed, 238 insertions(+), 42 deletions(-)
+
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
+index fed7e40..7136363 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.h
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
+@@ -223,6 +223,7 @@ typedef struct TextureBinding {
+     VmaAllocation allocation;
+     VkSampler sampler;
+     bool possibly_dirty;
++    bool replaced; /* image holds an RRL pack texture, not the guest shape */
+     uint64_t hash;
+     unsigned int draw_time;
+     uint32_t submit_time;
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index 465b07e..55d9f7a 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -473,6 +473,57 @@ static bool check_texture_possibly_dirty(NV2AState *d,
+     return possibly_dirty;
+ }
+ 
++/* Flush the mapped staging buffer and copy it into binding->image */
++static void copy_staging_to_image(PGRAPHState *pg, TextureBinding *binding,
++                                  VkFormat vk_format,
++                                  const VkBufferImageCopy *regions,
++                                  int num_regions)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++
++    vmaFlushAllocation(r->allocator,
++                       r->storage_buffers[BUFFER_STAGING_SRC].allocation, 0,
++                       VK_WHOLE_SIZE);
++
++    vmaUnmapMemory(r->allocator,
++                   r->storage_buffers[BUFFER_STAGING_SRC].allocation);
++
++    // FIXME: Use nondraw. Need to fill and copy tex buffer at once
++    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
++    pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
++
++    VkBufferMemoryBarrier host_barrier = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = r->storage_buffers[BUFFER_STAGING_SRC].buffer,
++        .size = VK_WHOLE_SIZE
++    };
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
++                         &host_barrier, 0, NULL);
++
++    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vk_format,
++                                      binding->current_layout,
++                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    binding->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++
++    vkCmdCopyBufferToImage(cmd, r->storage_buffers[BUFFER_STAGING_SRC].buffer,
++                           binding->image, binding->current_layout,
++                           num_regions, regions);
++
++    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vk_format,
++                                      binding->current_layout,
++                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++
++    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_4);
++    pgraph_vk_end_debug_marker(r, cmd);
++    pgraph_vk_end_single_time_commands(pg, cmd);
++}
++
+ // FIXME: Make sure we update sampler when data matches. Should we add filtering
+ // options to the textureshape?
+ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+@@ -543,47 +594,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
+     }
+     assert(buffer_offset <= r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
+ 
+-    vmaFlushAllocation(r->allocator,
+-                       r->storage_buffers[BUFFER_STAGING_SRC].allocation, 0,
+-                       VK_WHOLE_SIZE);
+-
+-    vmaUnmapMemory(r->allocator,
+-                   r->storage_buffers[BUFFER_STAGING_SRC].allocation);
+-
+-    // FIXME: Use nondraw. Need to fill and copy tex buffer at once
+-    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+-    pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
+-
+-    VkBufferMemoryBarrier host_barrier = {
+-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-        .buffer = r->storage_buffers[BUFFER_STAGING_SRC].buffer,
+-        .size = VK_WHOLE_SIZE
+-    };
+-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
+-                         &host_barrier, 0, NULL);
+-
+-    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
+-                                      binding->current_layout,
+-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-    binding->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+-
+-    vkCmdCopyBufferToImage(cmd, r->storage_buffers[BUFFER_STAGING_SRC].buffer,
+-                           binding->image, binding->current_layout,
+-                           num_regions, regions);
+-
+-    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
+-                                      binding->current_layout,
+-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+-    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+-
+-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_4);
+-    pgraph_vk_end_debug_marker(r, cmd);
+-    pgraph_vk_end_single_time_commands(pg, cmd);
++    copy_staging_to_image(pg, binding, vkf.vk_format, regions, num_regions);
+ 
+     // Release decoded texture data
+     for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+@@ -1130,6 +1141,144 @@ static void dump_texture(const TextureShape *s, bool linear, hwaddr offset,
+     fclose(f);
+ }
+ 
++/*
++ * RRL texture pack: $XEMU_TEXTURE_PACK_DIR/<content hash>.rgba replaces the
++ * guest texture with that hash. File: "RRT1", then little-endian u32 width,
++ * height and levels, then each level's R8G8B8A8 pixels, tightly packed, level
++ * sizes halving with a floor of 1. The size must be the guest size times a
++ * power of two (1 included) on both axes.
++ */
++typedef struct PackTexture {
++    uint32_t width, height, levels, shift;
++    size_t size;
++    uint8_t *data; /* points into file */
++    gchar *file;
++} PackTexture;
++
++static GHashTable *pack_index(void)
++{
++    static GHashTable *index; /* hash -> GINT_TO_POINTER(1) */
++    static bool loaded;
++
++    if (loaded) {
++        return index;
++    }
++    loaded = true;
++    const char *dir = g_getenv("XEMU_TEXTURE_PACK_DIR");
++    if (!dir) {
++        return NULL;
++    }
++    g_autoptr(GDir) d = g_dir_open(dir, 0, NULL);
++    if (!d) {
++        fprintf(stderr, "xemu: texture pack: cannot open %s\n", dir);
++        return NULL;
++    }
++    index = g_hash_table_new(g_direct_hash, g_direct_equal);
++    const char *name;
++    while ((name = g_dir_read_name(d))) {
++        char *end;
++        guint64 hash = g_ascii_strtoull(name, &end, 16);
++        if (end == name + 16 && !strcmp(end, ".rgba")) {
++            /* 64-bit hosts only, as in dump_texture */
++            g_hash_table_add(index, (gpointer)(uintptr_t)hash);
++        }
++    }
++    fprintf(stderr, "xemu: texture pack: %u textures in %s\n",
++            g_hash_table_size(index), dir);
++    return index;
++}
++
++static bool pack_has(uint64_t hash)
++{
++    GHashTable *index = pack_index();
++    return index && g_hash_table_contains(index, (gpointer)(uintptr_t)hash);
++}
++
++static void pack_texture_free(PackTexture *t)
++{
++    if (t) {
++        g_free(t->file);
++        g_free(t);
++    }
++}
++
++/* NULL (after one message; the hash is then forgotten) if the file is bad */
++static PackTexture *pack_load(uint64_t hash, const TextureShape *s,
++                              size_t staging_size)
++{
++    PackTexture *t = g_new0(PackTexture, 1);
++    gsize len = 0;
++    const char *err = NULL;
++    g_autofree gchar *path = g_strdup_printf(
++        "%s/%016" PRIx64 ".rgba", g_getenv("XEMU_TEXTURE_PACK_DIR"), hash);
++
++    /* shortcut: re-read from disk on every (re)creation; cache if it shows up in profiles */
++    if (!g_file_get_contents(path, &t->file, &len, NULL)) {
++        err = "unreadable";
++    } else if (len < 16 || memcmp(t->file, "RRT1", 4)) {
++        err = "bad header";
++    } else {
++        memcpy(&t->width, t->file + 4, 4);
++        memcpy(&t->height, t->file + 8, 4);
++        memcpy(&t->levels, t->file + 12, 4);
++        t->width = le32_to_cpu(t->width);
++        t->height = le32_to_cpu(t->height);
++        t->levels = le32_to_cpu(t->levels);
++        while (t->shift < 8 && (s->width << t->shift) < t->width) {
++            t->shift++;
++        }
++        for (uint32_t l = 0; l < t->levels && l < 16; l++) {
++            t->size += (size_t)MAX(1, t->width >> l) * MAX(1, t->height >> l) * 4;
++        }
++        if (t->levels < 1 || t->levels > 16 ||
++            t->width != s->width << t->shift ||
++            t->height != s->height << t->shift) {
++            err = "size is not the guest size times a power of two";
++        } else if (len != 16 + t->size) {
++            err = "length does not match its levels";
++        } else if (t->size > staging_size) {
++            err = "larger than the staging buffer";
++        }
++    }
++    if (err) {
++        fprintf(stderr, "xemu: texture pack: %s: %s, ignored\n", path, err);
++        g_hash_table_remove(pack_index(), (gpointer)(uintptr_t)hash);
++        pack_texture_free(t);
++        return NULL;
++    }
++    t->data = (uint8_t *)t->file + 16;
++    return t;
++}
++
++static void upload_pack_texture(PGRAPHState *pg, TextureBinding *binding,
++                                const PackTexture *t)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    uint8_t *mapped;
++
++    VK_CHECK(vmaMapMemory(r->allocator,
++                          r->storage_buffers[BUFFER_STAGING_SRC].allocation,
++                          (void *)&mapped));
++    memcpy(mapped, t->data, t->size);
++
++    g_autofree VkBufferImageCopy *regions =
++        g_malloc0_n(t->levels, sizeof(VkBufferImageCopy));
++    VkDeviceSize offset = 0;
++    for (uint32_t l = 0; l < t->levels; l++) {
++        uint32_t w = MAX(1, t->width >> l), h = MAX(1, t->height >> l);
++        regions[l] = (VkBufferImageCopy){
++            .bufferOffset = offset,
++            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .imageSubresource.mipLevel = l,
++            .imageSubresource.layerCount = 1,
++            .imageExtent = (VkExtent3D){ w, h, 1 },
++        };
++        offset += (VkDeviceSize)w * h * 4;
++    }
++    copy_staging_to_image(pg, binding, VK_FORMAT_R8G8B8A8_UNORM, regions,
++                          t->levels);
++}
++
+ static void create_texture(PGRAPHState *pg, int texture_idx)
+ {
+     NV2A_VK_DGROUP_BEGIN("Creating texture %d", texture_idx);
+@@ -1244,6 +1393,20 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+                      content_hash, raw_hash);
+     }
+ 
++    bool want_pack = content_hash && !f_basic.linear && !is_indexed &&
++                     !state.cubemap && state.dimensionality == 2 &&
++                     pack_has(content_hash);
++    if (binding_found && !surface_to_texture &&
++        (snode->draw_time || (possibly_dirty && content_hash != snode->hash)) &&
++        (snode->replaced || want_pack)) {
++        /* image size and format change with the content: rebuild below */
++        if (r->in_command_buffer && snode->submit_time == r->submit_count) {
++            pgraph_vk_finish(pg, VK_FINISH_REASON_NEED_BUFFER_SPACE);
++        }
++        texture_cache_release_node_resources(r, snode);
++        binding_found = false;
++    }
++
+     if (binding_found) {
+         if (surface_to_texture) {
+             if (surface->draw_time != snode->draw_time) {
+@@ -1269,6 +1432,12 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+     snode->possibly_dirty = false;
+     snode->hash = content_hash;
+ 
++    PackTexture *pack = want_pack ?
++        pack_load(content_hash, &state,
++                  r->storage_buffers[BUFFER_STAGING_SRC].buffer_size) :
++        NULL;
++    snode->replaced = pack != NULL;
++
+     VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
+     assert(vkf.vk_format != 0);
+     assert(0 < state.dimensionality);
+@@ -1293,6 +1462,13 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         .flags = (state.cubemap ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
+     };
+ 
++    if (pack) {
++        image_create_info.extent.width = pack->width;
++        image_create_info.extent.height = pack->height;
++        image_create_info.mipLevels = pack->levels;
++        image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++    }
++
+     if (surface_to_texture) {
+         pgraph_apply_scaling_factor(pg, &image_create_info.extent.width,
+                                         &image_create_info.extent.height);
+@@ -1312,7 +1488,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         .viewType = state.cubemap ?
+             VK_IMAGE_VIEW_TYPE_CUBE :
+             dimensionality_to_vk_image_view_type[state.dimensionality],
+-        .format = vkf.vk_format,
++        .format = image_create_info.format,
+         .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .subresourceRange.baseMipLevel = 0,
+         .subresourceRange.levelCount = image_create_info.mipLevels,
+@@ -1320,6 +1496,10 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         .subresourceRange.layerCount = image_create_info.arrayLayers,
+         .components = vkf.component_map,
+     };
++    if (pack) {
++        /* pack pixels are already RGBA as the game meant them */
++        image_view_create_info.components = (VkComponentMapping){ 0 };
++    }
+ 
+     VK_CHECK(vkCreateImageView(r->device, &image_view_create_info, NULL,
+                                &snode->image_view));
+@@ -1460,6 +1640,16 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         .pNext = sampler_next_struct,
+     };
+ 
++    if (pack && mipmap_en) {
++        /* guest level n is pack level n + shift; keep the finer ones usable */
++        sampler_create_info.minLod =
++            state.min_mipmap_level ?
++                MIN(state.min_mipmap_level + pack->shift, pack->levels - 1) :
++                0;
++        sampler_create_info.maxLod =
++            MIN(state.max_mipmap_level + pack->shift, pack->levels - 1);
++    }
++
+     VK_CHECK(vkCreateSampler(r->device, &sampler_create_info, NULL,
+                              &snode->sampler));
+ 
+@@ -1469,10 +1659,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+ 
+     if (surface_to_texture) {
+         copy_surface_to_texture(pg, surface, snode);
++    } else if (pack) {
++        upload_pack_texture(pg, snode, pack);
++        snode->draw_time = 0;
+     } else {
+         upload_texture_image(pg, texture_idx, snode);
+         snode->draw_time = 0;
+     }
++    pack_texture_free(pack);
+ 
+     NV2A_VK_DGROUP_END();
+ }
+@@ -1544,6 +1738,7 @@ static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *state)
+     snode->draw_time = 0;
+     snode->hash = 0;
+     snode->possibly_dirty = false;
++    snode->replaced = false;
+ }
+ 
+ static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode)
+-- 
+2.52.0
+

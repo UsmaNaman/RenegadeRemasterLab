@@ -1,0 +1,37 @@
+name: Adapter request
+description: Ask for support for a platform or game.
+labels: [adapter]
+body:
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Ownership
+      options:
+        - label: I legally own this game and I am not attaching copyrighted files, keys or BIOS dumps
+          required: true
+  - type: input
+    id: target
+    attributes:
+      label: Platform and game
+      placeholder: Original Xbox / Halo 2 (NTSC-U)
+    validations:
+      required: true
+  - type: input
+    id: dump
+    attributes:
+      label: Dump format you have
+      placeholder: XISO made with extract-xiso, redump ISO, ...
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: What do you want to do with it?
+      description: Identify, inspect, extract, convert, replace or rebuild, and why.
+    validations:
+      required: true
+  - type: textarea
+    id: prior
+    attributes:
+      label: Existing open-source tools or documentation
+      description: Links to source code or format docs only, never to data.

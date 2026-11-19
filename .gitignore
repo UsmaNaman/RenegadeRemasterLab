@@ -1,0 +1,63 @@
+# --- Python / tooling ---
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+
+# --- RRL safety net: game data, firmware and keys never enter git ---
+# Real data lives in the workspace (~/RRL-Workspace), outside this repo.
+# Disc and container images
+*.iso
+*.xiso
+*.cso
+*.zso
+*.chd
+*.cue
+*.img
+*.mdf
+*.mds
+*.nrg
+*.ecm
+*.gcm
+*.rvz
+*.wbfs
+*.god
+*.stfs
+*.xvd
+# Executables from consoles
+*.xbe
+*.xex
+# Firmware and keys
+*.rom
+*.bios
+*.key
+*.keys
+*.nvram
+mcpx*
+bios/
+keys/
+# Memory cards / saves
+*.mcd
+*.mcr
+*.vmc
+# Archives (commonly game dumps)
+*.7z
+*.rar
+*.zip
+# Working folders, in case someone points a workspace inside the repo
+RRL-Workspace/
+dumps/
+extracted/
+work/
+.rrl-cache/
+# *.bin and *.map are blocked by the pre-commit magic-byte hook instead of here,
+# because those extensions are also used by legitimate non-game files.
+
+# Claude Code agent worktrees
+.claude/worktrees/

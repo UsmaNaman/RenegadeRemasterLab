@@ -1,0 +1,28 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1024, --enforce-all]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+        exclude: ^patches/.*\.patch$  # patches need exact whitespace
+      - id: trailing-whitespace
+        exclude: ^patches/.*\.patch$  # patches need exact whitespace
+      - id: check-toml
+      - id: check-yaml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5 # keep in step with ruff in uv.lock
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: check-no-game-data
+        name: block game data, firmware and keys
+        entry: python3 scripts/check_no_game_data.py
+        language: system
+        types: [file]

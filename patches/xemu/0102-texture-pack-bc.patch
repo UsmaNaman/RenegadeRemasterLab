@@ -1,0 +1,134 @@
+From ddf5054467b819fdf10457a024d385115ff59e5a Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:48:16 +0000
+Subject: [PATCH] nv2a/vk: texture pack files may hold BC1 or BC3 levels
+
+Magic RRB1/RRB3 selects VK_FORMAT_BC1_RGBA_UNORM_BLOCK/BC3_UNORM_BLOCK
+(4x4 blocks, partial ones rounded up); RRT1 stays RGBA8. A format the GPU
+cannot sample is reported and the file ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZfY8PfkRfJCjArnYegSSy
+---
+ hw/xbox/nv2a/pgraph/vk/texture.c | 56 ++++++++++++++++++++++++--------
+ 1 file changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index 55d9f7a..72a5e5c 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -1143,13 +1143,16 @@ static void dump_texture(const TextureShape *s, bool linear, hwaddr offset,
+ 
+ /*
+  * RRL texture pack: $XEMU_TEXTURE_PACK_DIR/<content hash>.rgba replaces the
+- * guest texture with that hash. File: "RRT1", then little-endian u32 width,
+- * height and levels, then each level's R8G8B8A8 pixels, tightly packed, level
+- * sizes halving with a floor of 1. The size must be the guest size times a
+- * power of two (1 included) on both axes.
++ * guest texture with that hash. File: a magic, then little-endian u32 width,
++ * height and levels, then each level tightly packed, level sizes halving with
++ * a floor of 1. Magic "RRT1" is R8G8B8A8, "RRB1" BC1 and "RRB3" BC3 (4x4
++ * blocks of 8 or 16 bytes, partial blocks rounded up). The size must be the
++ * guest size times a power of two (1 included) on both axes.
+  */
+ typedef struct PackTexture {
+     uint32_t width, height, levels, shift;
++    VkFormat format;
++    uint32_t block_bytes; /* 0: 4 bytes per pixel, else per 4x4 block */
+     size_t size;
+     uint8_t *data; /* points into file */
+     gchar *file;
+@@ -1203,9 +1206,17 @@ static void pack_texture_free(PackTexture *t)
+ }
+ 
+ /* NULL (after one message; the hash is then forgotten) if the file is bad */
+-static PackTexture *pack_load(uint64_t hash, const TextureShape *s,
+-                              size_t staging_size)
++static size_t pack_level_size(const PackTexture *t, uint32_t level)
+ {
++    size_t w = MAX(1, t->width >> level), h = MAX(1, t->height >> level);
++    return t->block_bytes ? ((w + 3) / 4) * ((h + 3) / 4) * t->block_bytes :
++                            w * h * 4;
++}
++
++static PackTexture *pack_load(PGRAPHVkState *r, uint64_t hash,
++                              const TextureShape *s)
++{
++    size_t staging_size = r->storage_buffers[BUFFER_STAGING_SRC].buffer_size;
+     PackTexture *t = g_new0(PackTexture, 1);
+     gsize len = 0;
+     const char *err = NULL;
+@@ -1215,9 +1226,29 @@ static PackTexture *pack_load(uint64_t hash, const TextureShape *s,
+     /* shortcut: re-read from disk on every (re)creation; cache if it shows up in profiles */
+     if (!g_file_get_contents(path, &t->file, &len, NULL)) {
+         err = "unreadable";
+-    } else if (len < 16 || memcmp(t->file, "RRT1", 4)) {
++    } else if (len < 16) {
+         err = "bad header";
++    } else if (!memcmp(t->file, "RRT1", 4)) {
++        t->format = VK_FORMAT_R8G8B8A8_UNORM;
++    } else if (!memcmp(t->file, "RRB1", 4)) {
++        t->format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
++        t->block_bytes = 8;
++    } else if (!memcmp(t->file, "RRB3", 4)) {
++        t->format = VK_FORMAT_BC3_UNORM_BLOCK;
++        t->block_bytes = 16;
+     } else {
++        err = "bad header";
++    }
++    VkFormatProperties props;
++    if (!err) {
++        vkGetPhysicalDeviceFormatProperties(r->physical_device, t->format,
++                                            &props);
++        if (!(props.optimalTilingFeatures &
++              VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
++            err = "format not supported by this GPU";
++        }
++    }
++    if (!err) {
+         memcpy(&t->width, t->file + 4, 4);
+         memcpy(&t->height, t->file + 8, 4);
+         memcpy(&t->levels, t->file + 12, 4);
+@@ -1228,7 +1259,7 @@ static PackTexture *pack_load(uint64_t hash, const TextureShape *s,
+             t->shift++;
+         }
+         for (uint32_t l = 0; l < t->levels && l < 16; l++) {
+-            t->size += (size_t)MAX(1, t->width >> l) * MAX(1, t->height >> l) * 4;
++            t->size += pack_level_size(t, l);
+         }
+         if (t->levels < 1 || t->levels > 16 ||
+             t->width != s->width << t->shift ||
+@@ -1273,9 +1304,9 @@ static void upload_pack_texture(PGRAPHState *pg, TextureBinding *binding,
+             .imageSubresource.layerCount = 1,
+             .imageExtent = (VkExtent3D){ w, h, 1 },
+         };
+-        offset += (VkDeviceSize)w * h * 4;
++        offset += pack_level_size(t, l);
+     }
+-    copy_staging_to_image(pg, binding, VK_FORMAT_R8G8B8A8_UNORM, regions,
++    copy_staging_to_image(pg, binding, t->format, regions,
+                           t->levels);
+ }
+ 
+@@ -1433,8 +1464,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+     snode->hash = content_hash;
+ 
+     PackTexture *pack = want_pack ?
+-        pack_load(content_hash, &state,
+-                  r->storage_buffers[BUFFER_STAGING_SRC].buffer_size) :
++        pack_load(r, content_hash, &state) :
+         NULL;
+     snode->replaced = pack != NULL;
+ 
+@@ -1466,7 +1496,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         image_create_info.extent.width = pack->width;
+         image_create_info.extent.height = pack->height;
+         image_create_info.mipLevels = pack->levels;
+-        image_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++        image_create_info.format = pack->format;
+     }
+ 
+     if (surface_to_texture) {
+-- 
+2.52.0
+

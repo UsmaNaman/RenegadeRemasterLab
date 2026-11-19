@@ -1,0 +1,844 @@
+From e9d428e6c196b487188e3108a5a4bfb4944a1f13 Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:19:14 +0000
+Subject: [PATCH] macOS: Vulkan renderer via MoltenVK (local patch set)
+
+- meson: Vulkan dependency on darwin
+- vk: no external memory on Apple; display image read back and uploaded to GL texture
+- vk: geometry shader optional; no-GS path (vtxPosNP, dFdx/dFdy depth, quads -> triangles)
+- vk: forced 16x anisotropic filtering, alpha-aware border colour fallback
+- rebuild-mac-vulkan.sh helper
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/xbox/nv2a/pgraph/glsl/common.c |   3 +
+ hw/xbox/nv2a/pgraph/glsl/geom.c   |   1 +
+ hw/xbox/nv2a/pgraph/glsl/psh.c    |  35 ++++++-
+ hw/xbox/nv2a/pgraph/glsl/psh.h    |   2 +
+ hw/xbox/nv2a/pgraph/glsl/vsh.c    |   2 +
+ hw/xbox/nv2a/pgraph/vk/display.c  |  52 ++++++++++-
+ hw/xbox/nv2a/pgraph/vk/draw.c     | 148 +++++++++++++++++++++++++++---
+ hw/xbox/nv2a/pgraph/vk/gpuprops.c |   6 ++
+ hw/xbox/nv2a/pgraph/vk/instance.c |  51 ++++++++++
+ hw/xbox/nv2a/pgraph/vk/renderer.c |  34 ++++++-
+ hw/xbox/nv2a/pgraph/vk/renderer.h |  14 +++
+ hw/xbox/nv2a/pgraph/vk/shaders.c  |   6 +-
+ hw/xbox/nv2a/pgraph/vk/texture.c  |  33 ++++++-
+ meson.build                       |   7 ++
+ rebuild-mac-vulkan.sh             |  27 ++++++
+ 15 files changed, 392 insertions(+), 29 deletions(-)
+ create mode 100755 rebuild-mac-vulkan.sh
+
+diff --git a/hw/xbox/nv2a/pgraph/glsl/common.c b/hw/xbox/nv2a/pgraph/glsl/common.c
+index 887d2a2..0985f71 100644
+--- a/hw/xbox/nv2a/pgraph/glsl/common.c
++++ b/hw/xbox/nv2a/pgraph/glsl/common.c
+@@ -52,6 +52,9 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
+         { flat_s,      vec4_s,  "vtxPos1" },
+         { flat_s,      vec4_s,  "vtxPos2" },
+         { flat_s,      float_s, "triMZ"  },
++        /* (x, y, z, 1/w), screen-linear; depth source when there is no
++         * geometry shader to provide whole-triangle vtxPos0-2 */
++        { "noperspective ", vec4_s, "vtxPosNP" },
+     };
+ 
+     for (int i = 0; i < ARRAY_SIZE(attr); i++) {
+diff --git a/hw/xbox/nv2a/pgraph/glsl/geom.c b/hw/xbox/nv2a/pgraph/glsl/geom.c
+index df933fb..92d4b3b 100644
+--- a/hw/xbox/nv2a/pgraph/glsl/geom.c
++++ b/hw/xbox/nv2a/pgraph/glsl/geom.c
+@@ -355,6 +355,7 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
+         "  vtxPos0 = pz[0];\n"
+         "  vtxPos1 = pz[1];\n"
+         "  vtxPos2 = pz[2];\n"
++        "  vtxPosNP = v_vtxPosNP[index];\n"
+         "  triMZ = (isnan(pz[3].x) || isinf(pz[3].x)) ? 0.0 : pz[3].x;\n"
+         "  EmitVertex();\n"
+         "}\n",
+diff --git a/hw/xbox/nv2a/pgraph/glsl/psh.c b/hw/xbox/nv2a/pgraph/glsl/psh.c
+index b7325c3..276e5e8 100644
+--- a/hw/xbox/nv2a/pgraph/glsl/psh.c
++++ b/hw/xbox/nv2a/pgraph/glsl/psh.c
+@@ -997,6 +997,21 @@ static MString* psh_convert(struct PixelShader *ps)
+         );
+ 
+     MString *clip = mstring_new();
++    if (ps->opts.no_geom) {
++        /* Derivatives must be taken before any discard below. The depth
++         * plane is linear in screen space: z, or 1/w when z_perspective. */
++        mstring_append_fmt(
++            clip,
++            "precise float zsrc = vtxPosNP.%c;\n"
++            "vec2 zgrad = vec2(dFdx(zsrc), dFdy(zsrc)) * surfaceScale;\n"
++            "float tri_mz = max(abs(zgrad.x), abs(zgrad.y));\n"
++            "if (isnan(tri_mz) || isinf(tri_mz)) {\n"
++            "  tri_mz = 0.0;\n"
++            "}\n",
++            ps->state->z_perspective ? 'w' : 'z');
++    } else {
++        mstring_append(clip, "float tri_mz = triMZ;\n");
++    }
+     mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
+                        ps->state->window_clip_exclusive ? "Exc" : "Inc");
+     if (!ps->state->window_clip_exclusive) {
+@@ -1023,6 +1038,9 @@ static MString* psh_convert(struct PixelShader *ps)
+     }
+ 
+     if (ps->state->z_perspective) {
++        if (ps->opts.no_geom) {
++            mstring_append(clip, "precise float zvalue = 1.0 / zsrc;\n");
++        } else {
+         mstring_append(
+             clip,
+             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
+@@ -1040,14 +1058,17 @@ static MString* psh_convert(struct PixelShader *ps)
+             "}\n"
+             "bc1 *= inv_bcsum;\n"
+             "bc2 *= inv_bcsum;\n"
+-            "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n"
++            "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n");
++        }
++        mstring_append(
++            clip,
+             // If GPU clipping is inaccurate, the point gl_FragCoord.xy might
+             // be above the horizon of the plane of a rasterized triangle
+             // making the interpolated w-coordinate above zero or negative. We
+             // should prevent such wrapping through infinity by clamping to
+             // infinity.
+             "if (zvalue > 0.0) {\n"
+-            "  float zslopeofs = depthFactor*triMZ*zvalue*zvalue;\n"
++            "  float zslopeofs = depthFactor*tri_mz*zvalue*zvalue;\n"
+             "  zvalue += depthOffset;\n"
+             "  zvalue += zslopeofs;\n"
+             "} else {\n"
+@@ -1057,6 +1078,9 @@ static MString* psh_convert(struct PixelShader *ps)
+             "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+             "}\n");
+     } else {
++        if (ps->opts.no_geom) {
++            mstring_append(clip, "precise float zvalue = zsrc;\n");
++        } else {
+         mstring_append(
+             clip,
+             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
+@@ -1071,9 +1095,10 @@ static MString* psh_convert(struct PixelShader *ps)
+             "}\n"
+             "bc1 *= inv_bcsum;\n"
+             "bc2 *= inv_bcsum;\n"
+-            "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n"
+-            "zvalue += depthOffset;\n"
+-            "zvalue += depthFactor*triMZ;\n");
++            "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n");
++        }
++        mstring_append(clip, "zvalue += depthOffset;\n"
++                             "zvalue += depthFactor*tri_mz;\n");
+     }
+ 
+     /* Depth clipping */
+diff --git a/hw/xbox/nv2a/pgraph/glsl/psh.h b/hw/xbox/nv2a/pgraph/glsl/psh.h
+index 0c31e80..7936159 100644
+--- a/hw/xbox/nv2a/pgraph/glsl/psh.h
++++ b/hw/xbox/nv2a/pgraph/glsl/psh.h
+@@ -96,6 +96,8 @@ DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)
+ 
+ typedef struct GenPshGlslOptions {
+     bool vulkan;
++    /* No geometry shader: take depth from vtxPosNP and derivatives */
++    bool no_geom;
+     int ubo_binding;
+     int tex_binding;
+ } GenPshGlslOptions;
+diff --git a/hw/xbox/nv2a/pgraph/glsl/vsh.c b/hw/xbox/nv2a/pgraph/glsl/vsh.c
+index 69bf1bb..b4dfa16 100644
+--- a/hw/xbox/nv2a/pgraph/glsl/vsh.c
++++ b/hw/xbox/nv2a/pgraph/glsl/vsh.c
+@@ -253,6 +253,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
+                        "#define vtxPos1 v_vtxPos1\n"
+                        "#define vtxPos2 v_vtxPos2\n"
+                        "#define triMZ v_triMZ\n"
++                       "#define vtxPosNP v_vtxPosNP\n"
+                        );
+     }
+     mstring_append(header, "\n");
+@@ -412,6 +413,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
+                    "  vtxPos0 = vtxPos;\n"
+                    "  vtxPos1 = vtxPos;\n"
+                    "  vtxPos2 = vtxPos;\n"
++                   "  vtxPosNP = vec4(vtxPos.xyz, 1.0 / vtxPos.w);\n"
+                    "  triMZ = 0.0;\n"
+                    "  gl_PointSize = oPts.x;\n"
+     );
+diff --git a/hw/xbox/nv2a/pgraph/vk/display.c b/hw/xbox/nv2a/pgraph/vk/display.c
+index f4edc47..082479c 100644
+--- a/hw/xbox/nv2a/pgraph/vk/display.c
++++ b/hw/xbox/nv2a/pgraph/vk/display.c
+@@ -554,6 +554,11 @@ static void destroy_current_display_image(PGRAPHState *pg)
+     CloseHandle(d->handle);
+     d->handle = 0;
+ #endif
++#else
++    vmaDestroyBuffer(r->allocator, d->readback_buffer, d->readback_allocation);
++    d->readback_buffer = VK_NULL_HANDLE;
++    d->readback_allocation = VK_NULL_HANDLE;
++    d->readback_ptr = NULL;
+ #endif
+ 
+     vkDestroyImageView(r->device, d->image_view, NULL);
+@@ -614,11 +619,13 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+         .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
++        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExternalMemoryImageCreateInfo external_memory_image_create_info = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+ #ifdef WIN32
+@@ -628,6 +635,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+ #endif
+     };
+     image_create_info.pNext = &external_memory_image_create_info;
++#endif
+ 
+     VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL, &d->image));
+ 
+@@ -643,6 +651,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+     };
+ 
++#if HAVE_EXTERNAL_MEMORY
+     VkExportMemoryAllocateInfo export_memory_alloc_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes =
+@@ -654,6 +663,7 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+             ,
+     };
+     alloc_info.pNext = &export_memory_alloc_info;
++#endif
+ 
+     VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL, &d->memory));
+     VK_CHECK(vkBindImageMemory(r->device, d->image, d->memory, 0));
+@@ -671,6 +681,27 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
+     VK_CHECK(vkCreateImageView(r->device, &image_view_create_info, NULL,
+                                &d->image_view));
+ 
++#if !HAVE_EXTERNAL_MEMORY
++    /* No GL/Vulkan memory sharing: each frame is copied here and uploaded
++     * to a GL texture by pgraph_vk_get_framebuffer_surface */
++    VkBufferCreateInfo readback_info = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++        .size = (VkDeviceSize)width * height * 4,
++        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++    };
++    VmaAllocationCreateInfo readback_alloc_info = {
++        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
++        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
++                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
++    };
++    VmaAllocationInfo readback_result;
++    VK_CHECK(vmaCreateBuffer(r->allocator, &readback_info, &readback_alloc_info,
++                             &d->readback_buffer, &d->readback_allocation,
++                             &readback_result));
++    d->readback_ptr = readback_result.pMappedData;
++#endif
++
+ #if HAVE_EXTERNAL_MEMORY
+ 
+ #ifdef WIN32
+@@ -968,6 +999,25 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
+ 
+     vkCmdEndRenderPass(cmd);
+ 
++#if !HAVE_EXTERNAL_MEMORY
++    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
++                                      VK_FORMAT_R8G8B8A8_UNORM,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    VkBufferImageCopy readback_region = {
++        .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .imageSubresource.layerCount = 1,
++        .imageExtent = { disp->width, disp->height, 1 },
++    };
++    vkCmdCopyImageToBuffer(cmd, disp->image,
++                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                           disp->readback_buffer, 1, &readback_region);
++    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
++                                      VK_FORMAT_R8G8B8A8_UNORM,
++                                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++#endif
++
+ #if 0
+     VkImageCopy region = {
+         .srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+diff --git a/hw/xbox/nv2a/pgraph/vk/draw.c b/hw/xbox/nv2a/pgraph/vk/draw.c
+index bf535b4..5cc2f84 100644
+--- a/hw/xbox/nv2a/pgraph/vk/draw.c
++++ b/hw/xbox/nv2a/pgraph/vk/draw.c
+@@ -72,8 +72,14 @@ static VkPrimitiveTopology get_primitive_topology(PGRAPHState *pg)
+     case PRIM_TYPE_TRIANGLE_FAN:
+         return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+     case PRIM_TYPE_QUADS:
++        if (!r->enabled_physical_device_features.geometryShader) {
++            return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; /* see expand_quads */
++        }
+         return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+     case PRIM_TYPE_QUAD_STRIP:
++        if (!r->enabled_physical_device_features.geometryShader) {
++            return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        }
+         return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+     case PRIM_TYPE_POLYGON:
+         if (polygon_mode == POLY_MODE_LINE) {
+@@ -2019,6 +2025,58 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
+     buffer->buffer_offset += remap.buffer_space_required;
+ }
+ 
++/*
++ * Without geometry shaders (Metal/MoltenVK) quads can't be drawn as
++ * lines-with-adjacency, so expand them into triangle-list indices, using the
++ * same vertex order the geometry shader emits. src NULL means sequential
++ * vertices starting at first. Returns NULL when no expansion is needed.
++ */
++static GArray *expand_quads(PGRAPHState *pg, GArray *out, const uint32_t *src,
++                            uint32_t first, uint32_t count)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++    /* shader_binding isn't bound for this draw yet; use the live state */
++    int mode = pg->primitive_mode;
++
++    if (r->enabled_physical_device_features.geometryShader ||
++        (mode != PRIM_TYPE_QUADS && mode != PRIM_TYPE_QUAD_STRIP)) {
++        return out;
++    }
++    if (!out) {
++        out = g_array_new(FALSE, FALSE, sizeof(uint32_t));
++    }
++
++#define IDX(i) (src ? src[i] : first + (i))
++    uint32_t step = mode == PRIM_TYPE_QUADS ? 4 : 2;
++    for (uint32_t i = 0; i + 3 < count; i += step) {
++        uint32_t t[6];
++        if (mode == PRIM_TYPE_QUADS) {
++            uint32_t q[6] = { IDX(i), IDX(i + 1), IDX(i + 2),
++                              IDX(i), IDX(i + 2), IDX(i + 3) };
++            memcpy(t, q, sizeof(t));
++        } else {
++            uint32_t q[6] = { IDX(i),     IDX(i + 1), IDX(i + 2),
++                              IDX(i + 2), IDX(i + 1), IDX(i + 3) };
++            memcpy(t, q, sizeof(t));
++        }
++        g_array_append_vals(out, t, 6);
++    }
++#undef IDX
++
++    return out;
++}
++
++static void draw_indexed(PGRAPHState *pg, VkDeviceSize offset,
++                                uint32_t count)
++{
++    PGRAPHVkState *r = pg->vk_renderer_state;
++
++    vkCmdBindIndexBuffer(r->command_buffer,
++                         r->storage_buffers[BUFFER_INDEX].buffer, offset,
++                         VK_INDEX_TYPE_UINT32);
++    vkCmdDrawIndexed(r->command_buffer, count, 1, 0, 0, 0);
++}
++
+ void pgraph_vk_flush_draw(NV2AState *d)
+ {
+     PGRAPHState *pg = &d->pgraph;
+@@ -2031,6 +2089,9 @@ void pgraph_vk_flush_draw(NV2AState *d)
+ 
+     r->num_vertex_ram_buffer_syncs = 0;
+ 
++    g_autoptr(GArray) quad_idx = NULL;
++    VkDeviceSize quad_idx_offset = 0;
++
+     if (pg->draw_arrays_length) {
+         NV2A_VK_DGROUP_BEGIN("Draw Arrays");
+         nv2a_profile_inc_counter(NV2A_PROF_DRAW_ARRAYS);
+@@ -2039,6 +2100,19 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         assert(pg->inline_buffer_length == 0);
+         assert(pg->inline_array_length == 0);
+ 
++        for (int i = 0; i < pg->draw_arrays_length; i++) {
++            quad_idx = expand_quads(pg, quad_idx, NULL, pg->draw_arrays_start[i],
++                                    pg->draw_arrays_count[i]);
++        }
++        if (quad_idx) {
++            if (!quad_idx->len) {
++                NV2A_VK_DGROUP_END();
++                return;
++            }
++            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
++                                quad_idx->len * sizeof(uint32_t));
++        }
++
+         pgraph_vk_bind_vertex_attributes(d, pg->draw_arrays_min_start,
+                                          pg->draw_arrays_max_count - 1, false,
+                                          0, pg->draw_arrays_max_count - 1);
+@@ -2053,15 +2127,23 @@ void pgraph_vk_flush_draw(NV2AState *d)
+ 
+         begin_pre_draw(pg);
+         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
++        if (quad_idx) {
++            quad_idx_offset = pgraph_vk_update_index_buffer(
++                pg, quad_idx->data, quad_idx->len * sizeof(uint32_t));
++        }
+         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
+                                      "Draw Arrays");
+         begin_draw(pg);
+         bind_vertex_buffer(pg, remap.attributes, 0);
+-        for (int i = 0; i < pg->draw_arrays_length; i++) {
+-            uint32_t start = pg->draw_arrays_start[i],
+-                     count = pg->draw_arrays_count[i];
+-            NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
+-            vkCmdDraw(r->command_buffer, count, 1, start, 0);
++        if (quad_idx) {
++            draw_indexed(pg, quad_idx_offset, quad_idx->len);
++        } else {
++            for (int i = 0; i < pg->draw_arrays_length; i++) {
++                uint32_t start = pg->draw_arrays_start[i],
++                         count = pg->draw_arrays_count[i];
++                NV2A_VK_DPRINTF("- [%d] Start:%d Count:%d", i, start, count);
++                vkCmdDraw(r->command_buffer, count, 1, start, 0);
++            }
+         }
+         end_draw(pg);
+         pgraph_vk_end_debug_marker(r, r->command_buffer);
+@@ -2074,8 +2156,17 @@ void pgraph_vk_flush_draw(NV2AState *d)
+ 
+         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
+ 
+-        size_t index_data_size =
+-            pg->inline_elements_length * sizeof(pg->inline_elements[0]);
++        quad_idx = expand_quads(pg, NULL, pg->inline_elements, 0,
++                                pg->inline_elements_length);
++        if (quad_idx && !quad_idx->len) {
++            NV2A_VK_DGROUP_END();
++            return;
++        }
++        void *index_data = quad_idx ? (void *)quad_idx->data :
++                                      (void *)pg->inline_elements;
++        uint32_t index_count =
++            quad_idx ? quad_idx->len : pg->inline_elements_length;
++        size_t index_data_size = index_count * sizeof(uint32_t);
+ 
+         ensure_buffer_space(pg, BUFFER_INDEX_STAGING, index_data_size);
+ 
+@@ -2094,16 +2185,12 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         begin_pre_draw(pg);
+         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element + 1);
+         VkDeviceSize buffer_offset = pgraph_vk_update_index_buffer(
+-            pg, pg->inline_elements, index_data_size);
++            pg, index_data, index_data_size);
+         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
+                                      "Inline Elements");
+         begin_draw(pg);
+         bind_vertex_buffer(pg, remap.attributes, 0);
+-        vkCmdBindIndexBuffer(r->command_buffer,
+-                             r->storage_buffers[BUFFER_INDEX].buffer,
+-                             buffer_offset, VK_INDEX_TYPE_UINT32);
+-        vkCmdDrawIndexed(r->command_buffer, pg->inline_elements_length, 1, 0, 0,
+-                         0);
++        draw_indexed(pg, buffer_offset, index_count);
+         end_draw(pg);
+         pgraph_vk_end_debug_marker(r, r->command_buffer);
+ 
+@@ -2113,6 +2200,12 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         nv2a_profile_inc_counter(NV2A_PROF_INLINE_BUFFERS);
+         assert(pg->inline_array_length == 0);
+ 
++        quad_idx = expand_quads(pg, NULL, NULL, 0, pg->inline_buffer_length);
++        if (quad_idx) {
++            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
++                                quad_idx->len * sizeof(uint32_t));
++        }
++
+         size_t vertex_data_size = pg->inline_buffer_length * sizeof(float) * 4;
+         void *data[NV2A_VERTEXSHADER_ATTRIBUTES];
+         size_t sizes[NV2A_VERTEXSHADER_ATTRIBUTES];
+@@ -2136,11 +2229,21 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         begin_pre_draw(pg);
+         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
+             pg, data, sizes, r->num_active_vertex_attribute_descriptions);
++        if (quad_idx && quad_idx->len) {
++            quad_idx_offset = pgraph_vk_update_index_buffer(
++                pg, quad_idx->data, quad_idx->len * sizeof(uint32_t));
++        }
+         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
+                                      "Inline Buffer");
+         begin_draw(pg);
+         bind_inline_vertex_buffer(pg, buffer_offset);
+-        vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
++        if (quad_idx) {
++            if (quad_idx->len) {
++                draw_indexed(pg, quad_idx_offset, quad_idx->len);
++            }
++        } else {
++            vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
++        }
+         end_draw(pg);
+         pgraph_vk_end_debug_marker(r, r->command_buffer);
+ 
+@@ -2173,6 +2276,11 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         unsigned int index_count = pg->inline_array_length * 4 / vertex_size;
+ 
+         NV2A_DPRINTF("draw inline array %d, %d\n", vertex_size, index_count);
++        quad_idx = expand_quads(pg, NULL, NULL, 0, index_count);
++        if (quad_idx) {
++            ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
++                                quad_idx->len * sizeof(uint32_t));
++        }
+         pgraph_vk_bind_vertex_attributes(d, 0, index_count - 1, true,
+                                          vertex_size, index_count - 1);
+ 
+@@ -2180,11 +2288,21 @@ void pgraph_vk_flush_draw(NV2AState *d)
+         void *inline_array_data = pg->inline_array;
+         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
+             pg, &inline_array_data, &inline_array_data_size, 1);
++        if (quad_idx && quad_idx->len) {
++            quad_idx_offset = pgraph_vk_update_index_buffer(
++                pg, quad_idx->data, quad_idx->len * sizeof(uint32_t));
++        }
+         pgraph_vk_begin_debug_marker(r, r->command_buffer, RGBA_BLUE,
+                                      "Inline Array");
+         begin_draw(pg);
+         bind_inline_vertex_buffer(pg, buffer_offset);
+-        vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
++        if (quad_idx) {
++            if (quad_idx->len) {
++                draw_indexed(pg, quad_idx_offset, quad_idx->len);
++            }
++        } else {
++            vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
++        }
+         end_draw(pg);
+         pgraph_vk_end_debug_marker(r, r->command_buffer);
+         NV2A_VK_DGROUP_END();
+diff --git a/hw/xbox/nv2a/pgraph/vk/gpuprops.c b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+index ecc8bb3..0a5a31c 100644
+--- a/hw/xbox/nv2a/pgraph/vk/gpuprops.c
++++ b/hw/xbox/nv2a/pgraph/vk/gpuprops.c
+@@ -590,6 +590,12 @@ void pgraph_vk_determine_gpu_properties(NV2AState *d)
+     const int width = 640;
+     const int height = 480;
+ 
++    /* Winding only matters to the geometry shader, which we may not have */
++    if (!d->pgraph.vk_renderer_state->enabled_physical_device_features
++             .geometryShader) {
++        return;
++    }
++
+     uint8_t *pixels = render_geom_shader_triangles(d, width, height);
+     determine_triangle_winding_order(pixels, width, height,
+                                      &pgraph_vk_gpu_properties);
+diff --git a/hw/xbox/nv2a/pgraph/vk/instance.c b/hw/xbox/nv2a/pgraph/vk/instance.c
+index 1d42520..5190d1f 100644
+--- a/hw/xbox/nv2a/pgraph/vk/instance.c
++++ b/hw/xbox/nv2a/pgraph/vk/instance.c
+@@ -22,6 +22,46 @@
+ #include "renderer.h"
+ #include "xemu-version.h"
+ 
++#ifdef __APPLE__
++#include <dlfcn.h>
++#include <mach-o/dyld.h>
++
++/* Load MoltenVK directly (no Vulkan loader needed): bundled copy first,
++ * then Homebrew for dev builds. */
++static VkResult init_volk_apple(void)
++{
++    char exe[PATH_MAX];
++    uint32_t size = sizeof(exe);
++    g_autofree char *bundled = NULL;
++    if (_NSGetExecutablePath(exe, &size) == 0) {
++        g_autofree char *dir = g_path_get_dirname(exe);
++        bundled = g_build_filename(dir, "..", "Frameworks", "libMoltenVK.dylib",
++                                   NULL);
++    }
++    const char *candidates[] = {
++        bundled, "/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib",
++    };
++    for (int i = 0; i < ARRAY_SIZE(candidates); i++) {
++        if (!candidates[i]) {
++            continue;
++        }
++        void *h = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
++        if (!h) {
++            continue;
++        }
++        PFN_vkGetInstanceProcAddr gipa =
++            (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
++        if (gipa) {
++            fprintf(stderr, "Using Vulkan driver %s\n", candidates[i]);
++            volkInitializeCustom(gipa);
++            return VK_SUCCESS;
++        }
++        dlclose(h);
++    }
++    return volkInitialize();
++}
++#endif
++
+ #define VkExtensionPropertiesArray GArray
+ #define StringArray GArray
+ 
+@@ -35,6 +75,9 @@ static char const *const required_device_extensions[] = {
+ #ifdef WIN32
+     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
++#elif defined(__APPLE__)
++    /* MoltenVK: the spec requires enabling this when it is exposed */
++    VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+ #else
+     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+@@ -157,7 +200,11 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
+     PGRAPHVkState *r = pg->vk_renderer_state;
+     VkResult result;
+ 
++#ifdef __APPLE__
++    result = init_volk_apple();
++#else
+     result = volkInitialize();
++#endif
+     if (result != VK_SUCCESS) {
+         error_setg(errp, "volkInitialize failed");
+         return false;
+@@ -557,7 +604,11 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
+         }
+         F(depthClamp, true),
+         F(fillModeNonSolid, true),
++#ifdef __APPLE__
++        F(geometryShader, false), /* Metal has none; see pgraph_vk_has_geom */
++#else
+         F(geometryShader, true),
++#endif
+         F(occlusionQueryPrecise, true),
+         F(samplerAnisotropy, false),
+         F(shaderClipDistance, true),
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.c b/hw/xbox/nv2a/pgraph/vk/renderer.c
+index 4272bbc..29b7fb2 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.c
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.c
+@@ -198,9 +198,39 @@ static int pgraph_vk_get_framebuffer_surface(NV2AState *d)
+     qemu_event_wait(&d->pgraph.sync_complete);
+     return r->display.gl_texture_id;
+ #else
++    /* Same sync as above; render_display then copies the full-resolution
++     * frame into readback_ptr and waits for it, so we upload it to GL here.
++     * The display image is only recreated during this sync, so it is stable
++     * while we read it. */
++    qemu_event_reset(&d->pgraph.sync_complete);
++    qatomic_set(&pg->sync_pending, true);
++    pfifo_kick(d);
+     qemu_mutex_unlock(&d->pfifo.lock);
+-    pgraph_vk_wait_for_surface_download(surface);
+-    return 0;
++    qemu_event_wait(&d->pgraph.sync_complete);
++
++    PGRAPHVkDisplayState *disp = &r->display;
++    if (!disp->readback_ptr) {
++        return disp->gl_texture_id;
++    }
++    vmaInvalidateAllocation(r->allocator, disp->readback_allocation, 0,
++                            VK_WHOLE_SIZE);
++
++    if (!disp->gl_texture_id) {
++        glGenTextures(1, &disp->gl_texture_id);
++    }
++    glBindTexture(GL_TEXTURE_2D, disp->gl_texture_id);
++    if (disp->gl_width != disp->width || disp->gl_height != disp->height) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, disp->width, disp->height, 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, disp->readback_ptr);
++        disp->gl_width = disp->width;
++        disp->gl_height = disp->height;
++    } else {
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, disp->width, disp->height,
++                        GL_RGBA, GL_UNSIGNED_BYTE, disp->readback_ptr);
++    }
++    return disp->gl_texture_id;
+ #endif
+ }
+ 
+diff --git a/hw/xbox/nv2a/pgraph/vk/renderer.h b/hw/xbox/nv2a/pgraph/vk/renderer.h
+index 1eac3e0..fed7e40 100644
+--- a/hw/xbox/nv2a/pgraph/vk/renderer.h
++++ b/hw/xbox/nv2a/pgraph/vk/renderer.h
+@@ -41,7 +41,12 @@
+ #include "constants.h"
+ #include "glsl.h"
+ 
++#ifdef __APPLE__
++/* macOS GL can't import Vulkan memory; frames go back through guest VRAM */
++#define HAVE_EXTERNAL_MEMORY 0
++#else
+ #define HAVE_EXTERNAL_MEMORY 1
++#endif
+ 
+ typedef struct QueueFamilyIndices {
+     int queue_family;
+@@ -294,6 +299,15 @@ typedef struct PGRAPHVkDisplayState {
+ #endif
+     GLuint gl_memory_obj;
+     GLuint gl_texture_id;
++
++#if !HAVE_EXTERNAL_MEMORY
++    /* CPU copy of the display image; gl_texture_id is owned by the UI
++     * thread and sized gl_width x gl_height */
++    VkBuffer readback_buffer;
++    VmaAllocation readback_allocation;
++    void *readback_ptr;
++    int gl_width, gl_height;
++#endif
+ } PGRAPHVkDisplayState;
+ 
+ typedef struct ComputePipelineKey {
+diff --git a/hw/xbox/nv2a/pgraph/vk/shaders.c b/hw/xbox/nv2a/pgraph/vk/shaders.c
+index df5a527..8554aab 100644
+--- a/hw/xbox/nv2a/pgraph/vk/shaders.c
++++ b/hw/xbox/nv2a/pgraph/vk/shaders.c
+@@ -264,7 +264,10 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
+ 
+     ShaderModuleCacheKey key;
+ 
+-    bool need_geometry_shader = pgraph_glsl_need_geom(&binding->state.geom);
++    bool have_geometry_shader =
++        r->enabled_physical_device_features.geometryShader;
++    bool need_geometry_shader = have_geometry_shader &&
++                                pgraph_glsl_need_geom(&binding->state.geom);
+     if (need_geometry_shader) {
+         memset(&key, 0, sizeof(key));
+         key.kind = VK_SHADER_STAGE_GEOMETRY_BIT;
+@@ -289,6 +292,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
+     key.kind = VK_SHADER_STAGE_FRAGMENT_BIT;
+     key.psh.state = binding->state.psh;
+     key.psh.glsl_opts.vulkan = true;
++    key.psh.glsl_opts.no_geom = !have_geometry_shader;
+     key.psh.glsl_opts.ubo_binding = PSH_UBO_BINDING;
+     key.psh.glsl_opts.tex_binding = PSH_TEX_BINDING;
+     binding->psh.module_info = get_and_ref_shader_module_for_key(r, &key);
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index 861bd52..f1ad14e 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -1293,12 +1293,29 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+         // FIXME: Handle custom color in shader
+         if (is_integer_type) {
+             vk_border_color = VK_BORDER_COLOR_INT_TRANSPARENT_BLACK;
+-        } else if (border_color_pack32 == 0x00000000) {
+-            vk_border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+-        } else if (border_color_pack32 == 0xff000000) {
+-            vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+         } else {
+-            vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
++            /* Nearest of the three fixed colors, alpha first: a transparent
++             * border drawn opaque shows up as boxes around HUD elements */
++            uint32_t a = border_color_pack32 >> 24;
++            uint32_t rgb = border_color_pack32 & 0xffffff;
++            uint32_t luma = ((rgb >> 16 & 0xff) + (rgb >> 8 & 0xff) +
++                             (rgb & 0xff)) / 3;
++            if (a < 0x80) {
++                vk_border_color = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
++            } else if (luma < 0x80) {
++                vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
++            } else {
++                vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
++            }
++            static uint32_t last_logged = 0;
++            bool exact = border_color_pack32 == 0 ||
++                         border_color_pack32 == 0xff000000 ||
++                         border_color_pack32 == 0xffffffff;
++            if (!exact && border_color_pack32 != last_logged) {
++                last_logged = border_color_pack32;
++                fprintf(stderr, "vk: approximating border color 0x%08x\n",
++                        border_color_pack32);
++            }
+         }
+     }
+ 
+@@ -1345,6 +1362,12 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+     }
+     uint32_t sampler_max_anisotropy =
+         MIN(r->device_props.limits.maxSamplerAnisotropy, max_anisotropy);
++    /* Enhancement: force max anisotropy on smoothly filtered, mipmapped
++     * textures (sharper surfaces at grazing angles); leave others as asked */
++    if (mipmap_en && image_create_info.mipLevels > 1 &&
++        vk_min_filter == VK_FILTER_LINEAR) {
++        sampler_max_anisotropy = r->device_props.limits.maxSamplerAnisotropy;
++    }
+ 
+     VkSamplerCreateInfo sampler_create_info = {
+         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+diff --git a/meson.build b/meson.build
+index cc049c3..9c0ceeb 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2391,6 +2391,10 @@ if host_os == 'windows'
+   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
+ elif host_os == 'linux'
+   vulkan = dependency('vulkan')
++elif host_os == 'darwin'
++  # Headers from Homebrew vulkan-headers; MoltenVK is loaded at runtime by volk
++  vulkan = declare_dependency(compile_args: ['-I/opt/homebrew/opt/vulkan-headers/include',
++                                             '-DVK_ENABLE_BETA_EXTENSIONS'])
+ endif
+ 
+ if vulkan.found()
+@@ -2413,6 +2417,9 @@ if vulkan.found()
+   volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
+   if host_os == 'windows'
+     volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
++  elif host_os == 'darwin'
++    volk_opts.add_cmake_defines({'VULKAN_HEADERS_INSTALL_DIR': '/opt/homebrew/opt/vulkan-headers'})
++    volk_opts.append_compile_args('c', '-I/opt/homebrew/opt/vulkan-headers/include')
+   endif
+   volk_subproj = cmake.subproject('volk', options: volk_opts)
+   volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],
+diff --git a/rebuild-mac-vulkan.sh b/rebuild-mac-vulkan.sh
+new file mode 100755
+index 0000000..4ddba7d
+--- /dev/null
++++ b/rebuild-mac-vulkan.sh
+@@ -0,0 +1,27 @@
++#!/bin/bash
++# Rebuild the macOS Vulkan xemu into dist/xemu.app (run ./build.sh once first).
++set -euo pipefail
++cd "$(dirname "$0")"
++
++make -j"$(sysctl -n hw.ncpu)" qemu-system-i386
++
++# Reuse build.sh's packaging; its last step (license file) needs a pkg-config
++# setup we don't have, so tolerate that one failure.
++pkg=$(mktemp)
++awk '/^package_macos\(\) *\{/{f=1} f{print} f&&/^}/{exit}' build.sh > "$pkg"
++printf 'target_arch=arm64\nproject_source_dir=%s\npackage_macos\n' "$PWD" >> "$pkg"
++bash "$pkg" || true
++rm -f "$pkg"
++
++app=dist/xemu.app
++exe=$app/Contents/MacOS/xemu
++# dylibbundler adds an rpath the binary already has; new dyld refuses duplicates
++rp='@executable_path/../Libraries/arm64/'
++while [ "$(otool -l "$exe" | grep -c "path $rp")" -gt 1 ]; do
++    install_name_tool -delete_rpath "$rp" "$exe"
++done
++
++mkdir -p $app/Contents/Frameworks
++cp /opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib $app/Contents/Frameworks/
++codesign --force --deep -s - $app
++echo "Built $app"
+-- 
+2.52.0
+

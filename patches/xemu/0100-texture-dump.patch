@@ -1,0 +1,150 @@
+From 17ae638539b6f23aa760a98276d40df7f0c4592d Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:51:19 +0000
+Subject: [PATCH 1/2] nv2a/vk: optional texture dump keyed by content hash
+
+When XEMU_TEXTURE_DUMP_DIR is set, each distinct guest texture whose
+content hash is computed in create_texture is written once per run as
+<hash>_fmt<NN>_<w>x<h>_l<levels>[_cube][_d<depth>][_p<pitch>].bin
+(the exact hashed vram span, before palette XOR or decode), plus
+<hash>.pal for I8 textures and a row in index.tsv. Render-target
+textures are never hashed and so never dumped. Unset: no change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZfY8PfkRfJCjArnYegSSy
+---
+ hw/xbox/nv2a/pgraph/vk/texture.c | 66 ++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/hw/xbox/nv2a/pgraph/vk/texture.c b/hw/xbox/nv2a/pgraph/vk/texture.c
+index f1ad14e..465b07e 100644
+--- a/hw/xbox/nv2a/pgraph/vk/texture.c
++++ b/hw/xbox/nv2a/pgraph/vk/texture.c
+@@ -1068,6 +1068,68 @@ static bool is_linear_filter_supported_for_format(PGRAPHVkState *r,
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+ }
+ 
++/* Debug aid for RRL: dump each distinct guest texture's hashed bytes. */
++static void dump_texture(const TextureShape *s, bool linear, hwaddr offset,
++                         const void *data, size_t length,
++                         const void *palette, size_t palette_length,
++                         uint64_t hash, uint64_t raw_hash)
++{
++    static const char *dir;
++    static bool dir_read;
++    static GHashTable *seen;
++
++    if (!dir_read) {
++        dir = g_getenv("XEMU_TEXTURE_DUMP_DIR");
++        dir_read = true;
++        if (dir) {
++            g_mkdir_with_parents(dir, 0755);
++            /* 64-bit hosts only: the hash is stored as the pointer itself */
++            seen = g_hash_table_new(g_direct_hash, g_direct_equal);
++        }
++    }
++    if (!dir || g_hash_table_contains(seen, (gpointer)(uintptr_t)hash)) {
++        return;
++    }
++    g_hash_table_add(seen, (gpointer)(uintptr_t)hash);
++
++    g_autofree gchar *base = g_strdup_printf(
++        "%s/%016" PRIx64 "_fmt%02x_%ux%u_l%u%s", dir, hash, s->color_format,
++        s->width, s->height, s->levels, s->cubemap ? "_cube" : "");
++    g_autofree gchar *depth = s->depth > 1 ?
++        g_strdup_printf("_d%u", s->depth) : g_strdup("");
++    g_autofree gchar *pitch = linear ?
++        g_strdup_printf("_p%u", s->pitch) : g_strdup("");
++    g_autofree gchar *bin = g_strdup_printf("%s%s%s.bin", base, depth, pitch);
++    if (!g_file_set_contents(bin, data, length, NULL)) {
++        fprintf(stderr, "xemu: texture dump failed: %s\n", bin);
++        return;
++    }
++    if (palette_length) {
++        /* the .bin alone cannot be decoded for I8 formats */
++        g_autofree gchar *pal = g_strdup_printf("%s/%016" PRIx64 ".pal", dir,
++                                                hash);
++        g_file_set_contents(pal, palette, palette_length, NULL);
++    }
++
++    g_autofree gchar *index = g_build_filename(dir, "index.tsv", NULL);
++    FILE *f = fopen(index, "a");
++    if (!f) {
++        return;
++    }
++    fseek(f, 0, SEEK_END);
++    if (ftell(f) == 0) {
++        fputs("hash\traw_hash\tcolor_format\twidth\theight\tdepth\tlevels"
++              "\tmin_mip\tmax_mip\tcubemap\tlinear\tpitch\tlength"
++              "\tpalette_length\tvram_offset\n", f);
++    }
++    fprintf(f, "%016" PRIx64 "\t%016" PRIx64 "\t%u\t%u\t%u\t%u\t%u\t%u\t%u"
++            "\t%d\t%d\t%u\t%zu\t%zu\t0x%" HWADDR_PRIx "\n",
++            hash, raw_hash, s->color_format, s->width, s->height, s->depth,
++            s->levels, s->min_mipmap_level, s->max_mipmap_level, s->cubemap,
++            linear, s->pitch, length, palette_length, offset);
++    fclose(f);
++}
++
+ static void create_texture(PGRAPHState *pg, int texture_idx)
+ {
+     NV2A_VK_DGROUP_BEGIN("Creating texture %d", texture_idx);
+@@ -1173,9 +1235,13 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
+     uint64_t content_hash = 0;
+     if (!surface_to_texture && (snode->draw_time || possibly_dirty)) {
+         content_hash = fast_hash(texture_data, texture_length);
++        uint64_t raw_hash = content_hash;
+         if (is_indexed) {
+             content_hash ^= fast_hash(palette_data, texture_palette_data_size);
+         }
++        dump_texture(&state, f_basic.linear, texture_vram_offset, texture_data,
++                     texture_length, palette_data, texture_palette_data_size,
++                     content_hash, raw_hash);
+     }
+ 
+     if (binding_found) {
+-- 
+2.52.0
+
+
+From b9290d17cbb81c40e02eaaec1165f47756ad11fa Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 16:02:50 +0000
+Subject: [PATCH 2/2] util/fast-hash: compute standard XXH3 on little-endian
+ hosts
+
+xemu's configure sets auto_features=disabled, which meson also applies to
+the xxhash subproject's cpu-little-endian feature, so the build passes
+-DXXH_CPU_LITTLE_ENDIAN=0 on little-endian hosts (seen on arm64 macOS).
+XXH3_64bits then disagrees with every other XXH3 implementation, so
+texture dump hashes could not be reproduced outside xemu. Undefine it and
+inline xxhash in this file so the endianness is auto-detected.
+
+Changes every fast_hash value; they are only used as in-process cache keys
+except the GL renderer's on-disk shader cache list, which will miss once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZfY8PfkRfJCjArnYegSSy
+---
+ util/fast-hash.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/util/fast-hash.c b/util/fast-hash.c
+index 84e9c3c..cf03b1d 100644
+--- a/util/fast-hash.c
++++ b/util/fast-hash.c
+@@ -1,4 +1,11 @@
+ #include "qemu/fast-hash.h"
++/*
++ * configure's auto_features=disabled also disables the xxhash subproject's
++ * cpu-little-endian feature, which passes XXH_CPU_LITTLE_ENDIAN=0 on little
++ * endian hosts and yields non-standard XXH3 values. Let xxhash detect it.
++ */
++#undef XXH_CPU_LITTLE_ENDIAN
++#define XXH_INLINE_ALL
+ #include <xxhash.h>
+ 
+ uint64_t fast_hash(const uint8_t *data, size_t len)
+-- 
+2.52.0
+

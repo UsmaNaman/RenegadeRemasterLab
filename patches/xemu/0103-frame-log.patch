@@ -1,0 +1,40 @@
+From 0d643e18a0387d32052d8d451ec25e18f1e628ed Mon Sep 17 00:00:00 2001
+From: Usman Akram <102724070+UsmaNaman@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 21:05:46 +0000
+Subject: [PATCH] nv2a: optional per-flip frame log for RRL play sessions
+
+XEMU_FRAME_LOG=<file> receives one realtime-clock timestamp (us) per
+guest flip, for offline frame-time and stutter analysis.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XZfY8PfkRfJCjArnYegSSy
+---
+ hw/xbox/nv2a/pgraph/profile.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/hw/xbox/nv2a/pgraph/profile.c b/hw/xbox/nv2a/pgraph/profile.c
+index 2950420..cf9dfe3 100644
+--- a/hw/xbox/nv2a/pgraph/profile.c
++++ b/hw/xbox/nv2a/pgraph/profile.c
+@@ -27,6 +27,18 @@ void nv2a_profile_increment(void)
+     const int64_t fps_update_interval = 250000;
+     g_nv2a_stats.last_flip_time = now;
+ 
++    /* RRL: XEMU_FRAME_LOG=<file> gets one line per guest flip, in microseconds */
++    static FILE *frame_log;
++    static bool frame_log_read;
++    if (!frame_log_read) {
++        const char *path = g_getenv("XEMU_FRAME_LOG");
++        frame_log_read = true;
++        frame_log = path ? fopen(path, "w") : NULL;
++    }
++    if (frame_log) {
++        fprintf(frame_log, "%" PRId64 "\n", now);
++    }
++
+     static int64_t frame_count = 0;
+     frame_count++;
+ 
+-- 
+2.52.0
+

@@ -1,0 +1,4 @@
+# Files exempt from the blocked-extension check in scripts/check_no_game_data.py.
+# One repository-relative POSIX path per line, e.g. docs/example/app.js.map
+# Adding a line REQUIRES MAINTAINER REVIEW: confirm the file is not game data,
+# firmware or a key. Size and magic-byte checks still apply to listed files.

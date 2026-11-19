@@ -1,0 +1,37 @@
+name: Format research
+description: Share or discuss findings about a file format.
+labels: [research]
+body:
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Ownership
+      options:
+        - label: I legally own this game and I am not attaching copyrighted files, keys or BIOS dumps
+          required: true
+  - type: input
+    id: format
+    attributes:
+      label: Format
+      placeholder: Halo 2 Xbox .map header
+    validations:
+      required: true
+  - type: textarea
+    id: findings
+    attributes:
+      label: Findings
+      description: Offsets, field layouts, magic values. Short hex excerpts of headers are fine; no asset data.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: How did you verify it?
+      description: Tools, builds and regions tested, and what is still unverified.
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Sources
+      description: Links to open-source code or documentation only.

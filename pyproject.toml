@@ -1,0 +1,70 @@
+[project]
+name = "renegade-remaster-lab"
+version = "0.1.0a1"
+description = "Preserve, enhance and reimagine video games you legally own."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2",
+    "pillow>=11",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+    "Topic :: System :: Archiving",
+]
+
+[project.optional-dependencies]
+# xemu texture packs: XXH3-64, the hash xemu keys textures by (ADR-0009)
+packs = ["xxhash>=3.4"]
+
+[project.scripts]
+rrl = "rrl.cli.main:main"
+
+# Adapters register here. Third-party adapters use the same group in their own pyproject.
+[project.entry-points."rrl.adapters"]
+"xbox.original" = "rrl.adapters.xbox_original:XboxOriginalAdapter"
+"sony.ps2" = "rrl.adapters.sony_ps2:PS2Adapter"
+"sony.ps1" = "rrl.adapters.sony_ps1:PS1Adapter"
+"xbox.halo2" = "rrl.adapters.xbox_halo2:Halo2Adapter"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8", "mypy>=1.13", "pre-commit>=4"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rrl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# Run with TOX_WORK_DIR set to a temporary directory: uvx tox -e installed
+[tool.tox]
+requires = ["tox>=4.21"]
+env_list = ["installed"]
+
+[tool.tox.env.installed]
+package = "wheel"
+change_dir = "{env_tmp_dir}"
+set_env = { RRL_WORKSPACE = "{env_tmp_dir}/workspace" }
+commands = [["rrl", "--help"], ["rrl", "doctor"]]

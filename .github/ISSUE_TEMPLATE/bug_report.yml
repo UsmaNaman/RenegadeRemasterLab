@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in RRL does not work as expected.
+labels: [bug]
+body:
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Ownership
+      options:
+        - label: I legally own this game and I am not attaching copyrighted files, keys or BIOS dumps
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Commands you ran. Describe the input (platform, title, region, dump format); do not attach it.
+      placeholder: |
+        uv run rrl source add ~/dumps/game.iso
+        uv run rrl identify 1
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output and logs
+      render: text
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `uv run rrl doctor`, OS version and RRL commit.
+    validations:
+      required: true

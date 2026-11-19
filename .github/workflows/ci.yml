@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.3.3 # no floating major tag is published
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --all-extras
+      # Runs in CI so `git commit --no-verify` cannot bypass the pre-commit hook.
+      - name: Block game data
+        shell: bash
+        run: git ls-files -z | xargs -0 uv run python scripts/check_no_game_data.py
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy
+      - run: uv run pytest

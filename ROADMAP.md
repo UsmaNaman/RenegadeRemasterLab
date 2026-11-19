@@ -11,7 +11,7 @@
 | 6 PS1 | Adapter; DuckStation texture packs; mkpsxiso rebuild | |
 | 7 Xbox 360 on macOS | Evaluate Xenia Edge / macXenos on the M1 Pro; launcher; compat database | **Smoke test early (alongside M1)** |
 | 8 Desktop UI | PySide6 app over the same core | |
-| 9 Open-source release | Audit for assets/secrets, confirm licence, install docs, first public release (checklist below) | Planned |
+| 9 Open-source release | Audit for assets/secrets, confirm licence, install docs, first public release (checklist below) | **Done: v0.1.0a1 public 2026-11-19** |
 
 ## M1: "Foundation + first contact"
 Done when `rrl doctor`, `rrl source add`, `rrl identify` and `rrl inspect` work against the owner's
@@ -28,11 +28,11 @@ Scope: Halo 2 (original Xbox) asset extraction and the texture workflows. Roughl
 the disc-injection milestone. RRL ships code only: no textures, packs, extracted assets or links.
 
 Owner decisions:
-- [ ] Confirm the licence (GPL-3.0-or-later, provisional in ADR-0007)
-- [ ] Naming/branding: "Halo" only descriptive, never in the name or logo (Microsoft trademark; Game
+- [x] Confirm the licence (GPL-3.0-or-later, provisional in ADR-0007)
+- [x] Naming/branding: "Halo" only descriptive, never in the name or logo (Microsoft trademark; Game
       Content Usage Rules)
-- [ ] v0.1 scope: what ships, what stays private; whether the xemu patch fork (GPL-2) is published
-- [ ] Public hosting (GitHub repo, no remote yet)
+- [x] v0.1 scope: what ships, what stays private; whether the xemu patch fork (GPL-2) is published
+- [x] Public hosting (GitHub repo, no remote yet)
 
 Work:
 - [x] Finish disc injection: `rrl inject` (copy-only, provenance, validation), batch over a map (C5, C9, C10)
@@ -42,7 +42,7 @@ Work:
       supported formats and known limits
 - [x] Packaging: real version, `pipx install` from git (PyPI later); clean-machine install test;
       Linux and Windows checks (only macOS tested so far)
-- [ ] Release audit over the full git history: game data, local paths, personal details in docs/logs
+- [x] Release audit over the full git history: game data, local paths, personal details in docs/logs
       (C4 script; 2026-11-19 run: tree clean, only blocker is the owner's email as commit author ->
       rewrite authors to a GitHub no-reply address or publish a squashed history)
-- [ ] CI green on the public repo; tag v0.1.0; CHANGELOG entry
+- [x] CI green on the public repo; tag v0.1.0; CHANGELOG entry

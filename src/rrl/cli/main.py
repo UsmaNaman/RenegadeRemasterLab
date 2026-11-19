@@ -28,8 +28,10 @@ from rrl.core.hashing import sha256_file
 from rrl.core.logging import setup_logging
 from rrl.core.sources import SourceError, add_source, get_source, record_identity
 from rrl.emulators.frame_log import format_reports, summarize
+from rrl.emulators.pcsx2_pack import build_pack
 from rrl.emulators.xemu_textures import write_pack_texture
-from rrl.processors.upscale import upscale_export
+from rrl.processors.normals import process_tree
+from rrl.processors.upscale import upscale_export, upscale_folder
 from rrl.processors.video import remaster
 from rrl.store.provenance import operation
 
@@ -189,21 +191,26 @@ def cmd_extract(config: Config, conn: sqlite3.Connection, args: argparse.Namespa
     return 0
 
 
-def cmd_upscale(config: Config, conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+def _upscale_source_id(conn: sqlite3.Connection, source: str) -> int:
     # The registered source is only a catalogue key. Its disc can be offline.
-    if args.source.isdigit():
-        row = conn.execute("SELECT id FROM source WHERE id = ?", (args.source,)).fetchone()
+    if source.isdigit():
+        row = conn.execute("SELECT id FROM source WHERE id = ?", (source,)).fetchone()
     else:
-        path = Path(args.source).expanduser().resolve()
+        path = Path(source).expanduser().resolve()
         row = conn.execute(
             "SELECT id FROM source WHERE path = ? ORDER BY id DESC", (str(path),)
         ).fetchone()
     if row is None:
-        raise SourceError(f"no registered source for {args.source}")
-    source_id = row["id"]
-    export, out = (Path(p).expanduser().resolve() for p in (args.export, args.out))
+        raise SourceError(f"no registered source for {source}")
+    return int(row["id"])
+
+
+def cmd_upscale(config: Config, conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    source_id = None if args.pngs else _upscale_source_id(conn, args.source)
+    paths = args.pngs or (args.export, args.out)
+    export, out = (Path(p).expanduser().resolve() for p in paths)
     params = {
-        "export": str(export),
+        "pngs" if args.pngs else "export": str(export),
         "out": str(out),
         "model": args.model,
         "scale": args.scale,
@@ -219,6 +226,19 @@ def cmd_upscale(config: Config, conn: sqlite3.Connection, args: argparse.Namespa
                     "UPDATE operation SET tools_json = ? WHERE id = ?",
                     (json.dumps({"upscaler": str(backend)}), op_id),
                 )
+            if source_id is None:
+                count = upscale_folder(
+                    conn,
+                    config.store_path,
+                    export,
+                    out,
+                    backend,
+                    args.model,
+                    args.scale,
+                    args.max_side,
+                )
+                print(f"upscaled {count} PNGs in {out}")
+                return 0
             upscale_export(
                 conn,
                 config.store_path,
@@ -236,6 +256,27 @@ def cmd_upscale(config: Config, conn: sqlite3.Connection, args: argparse.Namespa
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_normals(config: Config, conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    mode = args.normals_command
+    params: dict[str, Any] = {"input": args.input, "out": args.out}
+    if mode == "from-height":
+        params.update(strength=args.strength, wrap=args.wrap)
+    try:
+        with operation(conn, f"normals-{mode}", params=params):
+            written, skipped = process_tree(
+                Path(args.input).expanduser(),
+                Path(args.out).expanduser(),
+                mode=mode,
+                strength=args.strength,
+                wrap=args.wrap,
+            )
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"wrote {written} normal maps, skipped {skipped} identical PNGs")
     return 0
 
 
@@ -376,6 +417,19 @@ def cmd_inject(config: Config, conn: sqlite3.Connection, args: argparse.Namespac
     return 0
 
 
+def cmd_pack_pcsx2(config: Config, conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    dump, images, pack = (Path(p).expanduser() for p in (args.dump, args.images, args.pack))
+    params = {"dump": args.dump, "images": args.images, "pack": args.pack, "serial": args.serial}
+    try:
+        with operation(conn, "pack-pcsx2", params=params):
+            report = build_pack(dump, images, pack, args.serial)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(asdict(report), indent=2))
+    return 0
+
+
 def cmd_pack_build(config: Config, conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     """Turn edited copies of `rrl extract --export` PNGs into an xemu texture pack (ADR-0009)."""
     source_id, _ = get_source(conn, args.source)
@@ -492,11 +546,12 @@ def build_parser() -> argparse.ArgumentParser:
     ext.add_argument("--export", metavar="DIR", help="also copy extracted files to this folder")
     ext.set_defaults(func=cmd_extract)
 
-    up = sub.add_parser("upscale", help="enhance PNG textures from an extraction export")
-    up.add_argument("source", help="registered source ID or path")
-    up.add_argument("--export", required=True, metavar="DIR", help="extracted PNG tree")
-    up.add_argument("--out", required=True, metavar="DIR", help="mirrored enhanced PNG tree")
+    up = sub.add_parser("upscale", help="enhance PNGs from an extraction or a plain folder")
+    up.add_argument("source", nargs="?", help="registered source ID or path")
+    up.add_argument("--export", metavar="DIR", help="extracted PNG tree")
+    up.add_argument("--out", metavar="DIR", help="mirrored enhanced PNG tree")
     up.add_argument("--scale", type=int, choices=[2, 4], default=4)
+    up.add_argument("--pngs", nargs=2, metavar=("IN", "OUT"), help="enhance a plain PNG folder")
     up.add_argument("--model", default="realesrgan-x4plus", help="native 4x model name")
     up.add_argument("--only", nargs="+", metavar="PREFIX", default=[], help="logical path prefixes")
     up.add_argument(
@@ -507,6 +562,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--upscaler", metavar="PATH", help="local realesrgan-ncnn-vulkan executable")
     up.set_defaults(func=cmd_upscale)
+
+    normals = sub.add_parser("normals", help="process tangent-space normal maps")
+    normal_sub = normals.add_subparsers(dest="normals_command", required=True)
+    fix = normal_sub.add_parser("fix", help="renormalize edited normal maps")
+    height = normal_sub.add_parser("from-height", help="derive normals from luminance")
+    for command in (fix, height):
+        command.add_argument("input", metavar="IN_DIR")
+        command.add_argument("out", metavar="OUT_DIR")
+        command.set_defaults(func=cmd_normals, strength=2.0, wrap=False)
+    height.add_argument("--strength", type=float, default=2.0, help="height gradient multiplier")
+    height.add_argument("--wrap", action="store_true", help="sample across tiling seams")
 
     video = sub.add_parser("video", help="process pre-rendered video")
     video_sub = video.add_subparsers(dest="video_command", required=True)
@@ -555,8 +621,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.set_defaults(func=cmd_perf_report)
 
-    pk = sub.add_parser("pack", help="xemu texture packs")
+    pk = sub.add_parser("pack", help="build emulator texture packs")
     pk_sub = pk.add_subparsers(dest="pack_command", required=True)
+    pcsx2 = pk_sub.add_parser("pcsx2", help="build a replacement pack from a PCSX2 dump")
+    pcsx2.add_argument("dump", metavar="DUMP_DIR")
+    pcsx2.add_argument("images", metavar="IMAGES_DIR")
+    pcsx2.add_argument("pack", metavar="PACK_DIR")
+    pcsx2.add_argument("--serial", required=True, help="game serial such as SLUS-12345")
+    pcsx2.set_defaults(func=cmd_pack_pcsx2)
     build = pk_sub.add_parser("build", help="pack edited PNGs, laid out like an extract export")
     build.add_argument("source")
     build.add_argument("images", help="folder of edited PNGs (same relative paths as the export)")
@@ -568,6 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "upscale":
+        if args.pngs:
+            if args.source or args.export or args.out or args.only or args.packable_only:
+                parser.error("--pngs cannot use SOURCE, --export, --out, --only or --packable-only")
+        elif not (args.source and args.export and args.out):
+            parser.error("upscale requires SOURCE --export DIR --out DIR or --pngs IN OUT")
     if args.command == "inject":
         target = (args.map, args.tag, args.index)
         if args.images is not None and any(value is not None for value in target):

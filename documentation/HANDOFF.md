@@ -35,7 +35,7 @@ Each task is self-contained and needs no game data. Rules: `AGENTS.md`. One task
 ## C4: Release audit script (done, merged 2026-11-18)
 - **Goal:** `scripts/release_audit.py`, a read-only check over the whole git history (all commits,
   not just HEAD) before going public.
-- **Reports:** absolute home paths (`/Users/...`), e-mail addresses, files whose bytes match the
+- **Reports:** absolute home paths (`/Users/<name>`), e-mail addresses, files whose bytes match the
   game-data magic checks in `scripts/check_no_game_data.py` (reuse it), binaries over 1 MB, secrets
   patterns (keys, tokens). Output: a table per finding with commit, path, line; exit 1 on findings.
 - **Tests:** synthetic temporary git repos built in the test.
@@ -214,3 +214,68 @@ Each task is self-contained and needs no game data. Rules: `AGENTS.md`. One task
   clear error), percentiles and windows checked exactly; `--json` schema stable.
 - **Never:** read outside the repo; depend on a real session log.
 - **Done when:** all AGENTS.md checks pass and USAGE documents it next to the launcher workflow.
+
+## C13: `scripts/publish.py` (safe updates to the public repo) (done, merged 2026-11-19)
+- **Goal:** the public repo (`origin`, branch `main`) is one squashed history authored by the GitHub
+  no-reply address. Local `master` has a private author email in every commit and must never be pushed.
+  Make publishing new `master` work a single safe command.
+- **Behaviour:** `python scripts/publish.py [--message MSG] [--dry-run] [--push]`:
+  1. Fetch `origin/main`; refuse if the working tree is dirty or `origin/main`'s tree is not an ancestor
+     state of `master` it can diff against (clear error).
+  2. Build one new commit with `git commit-tree master^{tree} -p origin/main`, author and committer from
+     `--identity` (default: read `rrl.publishIdentity` from `git config`, format `Name <email>`). Refuse
+     unless the email ends in `@users.noreply.github.com`.
+  3. Point local branch `release` at it (create if missing). Never touch `master`.
+  4. Run the release audit (`scripts/release_audit.py`) restricted to `release` (add a `--ref` option to
+     the audit if it lacks one, keeping its current default behaviour). Any `email` finding that is not a
+     `noreply` address, `you@example.com`, or a `From:` line under `patches/xemu/` fails the publish.
+  5. Only with `--push`: `git push origin release:refs/heads/main` (never `--force`, never other refs).
+     `--dry-run` prints the plan and audit result and creates nothing.
+  6. Optional `--tag vX.Y.Z` makes an annotated tag on the new commit with the same identity and pushes
+     only that tag.
+- **Also:** a `.githooks/pre-push` script (documented, opt-in via `git config core.hooksPath`) that
+  rejects pushing any commit whose author or committer email is not a noreply address.
+- **Tests:** `tests/tooling/test_publish.py` with throwaway repos in `tmp_path` and a bare repo as
+  `origin`: happy path (one commit on top of origin/main, tree equals master), non-noreply identity
+  refused, dirty tree refused, audit failure blocks the push, `--dry-run` creates no refs, tag identity,
+  pre-push hook rejects a private-email commit. Use fake addresses only (built at runtime, never literal in docs).
+- **Never:** push anywhere in tests except the temp bare repo; read the real repo's remote; use force.
+- **Done when:** all AGENTS.md checks pass; CONTRIBUTING.md has a short "Publishing" section.
+
+## C14: normal-map processor (`rrl normals`) (done, merged 2026-11-19)
+- **Goal:** `rrl upscale` skips bump/normal maps (`_skip_reason` in `processors/upscale.py`) because a
+  generic upscaler breaks unit-length normals. Add a processor that makes them usable at high resolution.
+- **CLI:** `rrl normals fix IN_DIR OUT_DIR` and `rrl normals from-height IN_DIR OUT_DIR [--strength 2.0]
+  [--wrap]`. Mirrors the relative PNG tree, skips existing identical outputs, writes atomically.
+  - `fix`: decode RGB as `n = rgb/127.5 - 1`, renormalize to unit length (z >= 0, rebuild z from x,y if
+    the input is two-channel), re-encode. For maps upscaled outside RRL.
+  - `from-height`: luminance as height, Sobel gradients scaled by `--strength`, tangent-space normal
+    (OpenGL convention, +Y up; document it), `--wrap` for tiling textures (wrap edges instead of clamp).
+- **Placement:** `src/rrl/processors/normals.py` (numpy + Pillow, already dependencies; no platform
+  code) and CLI wiring. Leave `rrl upscale` behaviour unchanged.
+- **Tests:** synthetic images only: flat height -> (128,128,255); a linear ramp gives the exact expected
+  constant normal; `fix` output has |n| within 1/127 of 1 for random inputs; wrap vs clamp differ only at
+  edges; two-channel input; odd sizes; non-PNG and malformed files give clear errors.
+- **Never:** read outside the repo; touch adapters.
+- **Done when:** all AGENTS.md checks pass; USAGE documents both subcommands and the Blender use.
+
+## C15: PCSX2 texture-pack writer (PS2 groundwork) (done, merged 2026-11-19)
+- **Goal:** the PS2 counterpart of `rrl pack build`. PCSX2 loads replacement textures from
+  `textures/<SERIAL>/replacements/` with filenames derived from its texture hash (research PCSX2's
+  documented dump/replace naming, e.g. `<hash>-<format>.png` / `.dds`, and cite the source URL in
+  `documentation/platforms/ps2.md`, marked [V] only if verified from PCSX2 source or docs).
+- **CLI:** `rrl pack pcsx2 DUMP_DIR IMAGES_DIR PACK_DIR --serial SLUS-12345`. Input is a PCSX2 *dump*
+  folder (the user dumps textures in PCSX2 themselves) and a folder of edited/upscaled PNGs with the same
+  filenames. Output: the replacement folder layout PCSX2 expects, PNGs copied or optionally re-encoded as
+  DDS (BC7 only if a stdlib/numpy path exists; otherwise PNG only, and say so). Report missing/extra/
+  size-mismatched files; never modify the dump folder. Serial validated against the PS2 serial pattern.
+- **Reuse:** `rrl upscale` needs a registered source today. Add a plain folder mode,
+  `rrl upscale --pngs IN OUT [--scale] [--model] [--max-side]`, reusing `upscale_batch`, so the PS2 flow
+  is dump -> upscale -> pack. Existing source-mode behaviour and tests stay unchanged.
+- **Placement:** `src/rrl/emulators/pcsx2_pack.py` plus CLI wiring.
+- **Tests:** synthetic dump folders with fake hash names: layout, serial validation, missing/extra
+  reporting, dump folder unchanged (hash it before/after), filename edge cases (path traversal names
+  rejected).
+- **Never:** read outside the repo; ship or fetch real dumps; download PCSX2.
+- **Done when:** all AGENTS.md checks pass; USAGE has a short PS2 section (dump in PCSX2 -> upscale ->
+  pack -> enable "Load Textures" in PCSX2).

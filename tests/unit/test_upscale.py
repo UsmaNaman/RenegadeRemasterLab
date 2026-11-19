@@ -254,3 +254,58 @@ def test_p8_from_another_adapter_is_eligible(
         conn.execute("UPDATE operation SET adapter_id = 'test.palette' WHERE op = 'extract'")
     assert main([*export_args, "--only", "a/p8.png", "--upscaler", str(backend)]) == 0
     assert (tmp_path / "out/a/p8.png").is_file()
+
+
+def test_plain_folder(
+    workspace: Path, tmp_path: Path, backend: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dump, out = tmp_path / "dump", tmp_path / "out"
+    (dump / "part").mkdir(parents=True)
+    name = "part/01-A.PNG"
+    Image.new("RGBA", (3, 2), (40, 50, 60, 77)).save(dump / name)
+    (dump / "notes.txt").touch()
+    args = [
+        "upscale",
+        "--pngs",
+        str(dump),
+        str(out),
+        "--upscaler",
+        str(backend),
+        "--model",
+        "local-4x",
+        "--max-side",
+        "10",
+    ]
+    assert main(args) == 0
+    with Image.open(out / name) as image:
+        assert image.size == (6, 4)
+        assert image.getchannel("A").getextrema() == (77, 77)
+    assert not (out / "notes.txt").exists()
+    pack = tmp_path / "pack"
+    assert (
+        main(
+            [
+                "pack",
+                "pcsx2",
+                str(dump / "part"),
+                str(out / "part"),
+                str(pack),
+                "--serial",
+                "SLUS-12345",
+            ]
+        )
+        == 0
+    )
+    replacement = pack / "textures/SLUS-12345/replacements/01-A.PNG"
+    assert replacement.read_bytes() == (out / name).read_bytes()
+    assert (tmp_path / "calls").read_text().strip() == "local-4x (3, 2)"
+    with closing(db.connect(workspace / "rrl.db")) as conn:
+        op = conn.execute("SELECT source_id, status FROM operation WHERE op = 'upscale'").fetchone()
+        assert tuple(op) == (None, "succeeded")
+    with pytest.raises(SystemExit):
+        main([*args, "--packable-only"])
+    assert "--pngs cannot use" in capsys.readouterr().err
+    assert (
+        main(["upscale", "--pngs", str(dump), str(dump / "nested"), "--upscaler", str(backend)])
+        == 1
+    )

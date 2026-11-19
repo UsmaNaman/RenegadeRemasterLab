@@ -2,6 +2,34 @@
 
 Newest first. Each entry covers what was done, what was decided, and what is next.
 
+## 2026-11-19: C13: audited public updates
+- **Code.** Added the squash publisher, a single-ref audit mode, an opt-in pre-push identity hook and publishing instructions.
+- **Decisions.** Match the public tree against any reachable master snapshot. Audit the candidate before updating release. Dry runs discard fetched and generated objects. An opted-in push pins the audited objects and publishes the branch and optional tag atomically.
+- **Checks.** All 447 tests passed, including eight disposable-repository cases. Offline dependency sync, Ruff lint and format, mypy and the game-data check passed.
+- **Open.** The C13 brief itself contains a sample address outside the allowed list. That line will block publishing until the lead revises it. Live remote access and publishing were outside this run.
+- **Review (lead).** Dry run against the real public repo refused on Anthropic's `noreply@anthropic.com` trailer and on findings already in the public commit. Allowed that address; the publish audit now checks only the new snapshot (`--since`), with a test. The dry run then flagged only real issues in the new tree, which were fixed.
+
+## 2026-11-19: C14: tangent-space normal maps
+- **Code.** Added `rrl normals fix` and `from-height`, atomic mirrored PNG output, provenance, synthetic tests and Blender node setup in USAGE.
+- **Decisions.** Interpret both bands of an LA normal PNG as XY, reconstruct positive Z and retain independent alpha on RGBA maps. Clamp negative RGB Z. Use normalized Sobel slopes per pixel, OpenGL +Y up, clamped borders by default and wrapped borders on request.
+- **Checks.** All 446 tests passed. Synthetic images verified ramp direction and magnitude, flat and wrapped heights, odd dimensions, reconstructed Z, quantized unit length and repeat writes. Offline dependency sync, Ruff lint and format, mypy and the game-data check passed.
+- **Open.** Blender shading on real materials was outside the synthetic test scope.
+- **Review (lead).** Three real Halo 2 bump maps upscaled 4x with realesrgan-x4plus were 2.8-9.9% off unit length; `fix` brought them to 0.08-0.19% (8-bit limit). A rerun skipped all three. `from-height` ran on a real diffuse texture.
+
+## 2026-11-19: C15: PCSX2 PNG replacement packs
+- **Code.** Added `rrl pack pcsx2` and plain-folder `rrl upscale --pngs IN OUT` using the existing batched backend. USAGE covers dump, upscale, pack and load. The pack report lists missing, extra and size-mismatched images by name.
+- **Decisions.** Match exact flat dump basenames and preserve the edited PNG bytes. Accept native size or a uniform positive integer enlargement. Replace individual matching files atomically and leave unrelated existing replacements alone. PNG output avoids adding a BC7 encoder.
+- **Checks.** All 449 tests passed. A synthetic dump went through the fake upscaler and into the replacement tree. Tests checked alpha, side-length fallback, source-mode compatibility, dump hashes, serial validation, unsafe names and failed replacements. Offline dependency sync, Ruff lint and format, mypy and the game-data check passed.
+- **Open.** Local research notes establish hash matching but omit the upstream naming grammar. The platform notes link to the PCSX2 implementation and mark the details [M]. Upstream source inspection and a live emulator load remain unverified under the repository-only constraint.
+- **Review (lead).** Checked PCSX2's GSTextureReplacements.cpp: `dumps`/`replacements` layout, hex filename grammar and the ignored `-mipN` names are now [V] in ps2.md. A live PCSX2 load is still untested (PCSX2 not installed).
+
+## 2026-11-19: public alpha released; C13-C15 briefed
+- **Release.** github.com/UsmaNaman/RenegadeRemasterLab is public: one squashed commit plus tag `v0.1.0a1`, all with the GitHub no-reply identity. A fresh-clone audit found no personal email, home paths or game data. CI passed on Ubuntu, Windows and macOS with Python 3.12 and 3.13.
+- **Guard.** A local, untracked `.git/hooks/pre-push` refuses commits or tags with a non-noreply email.
+- **Briefs.** C13 (`scripts/publish.py` for safe squashed updates), C14 (`rrl normals`), C15 (PCSX2 pack writer plus folder-mode upscale).
+- **Play prep.** The dev xemu now has `skip_boot_anim = true` (config backed up). A 1024 px-capped pack (`packs/h2-all-cap1024`) is built for a stutter A/B against `h2-all-4x`.
+- **Open.** BlackHole is installed but needs a restart before Multi-Output setup.
+
 ## 2026-11-19: C12: guest frame-timing reports
 - **CLI.** `rrl perf report` summarizes flip timing, windows and hitches from patch 0103. Two captures can be compared side by side or exported together as versioned JSON. USAGE documents the launcher and report workflow.
 - **Decisions.** Discard an unterminated final record. Compute rates from completed intervals, interpolate percentiles and assign each interval to the window of its ending flip. Hitch offsets identify the beginning of the wait.

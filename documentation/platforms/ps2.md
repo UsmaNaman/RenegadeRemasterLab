@@ -20,3 +20,19 @@ not been tested here.
 [M] Both adapters use the same [serial-prefix region hints](ps1.md#region-hints).
 Non-serial executable names and titles requiring a UDF-only directory tree
 are outside the implemented subset.
+
+## PCSX2 texture replacements
+
+Source: [GSTextureReplacements.cpp](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp)
+(read 2026-11-19).
+
+- [V] Dumps are written flat to `<textures>/<SERIAL>/dumps/`; replacements are read from
+  `<textures>/<SERIAL>/replacements/` (searched recursively) or `<SERIAL>.zip` beside it. The serial is
+  the disc serial, e.g. `SLUS-20946`.
+- [V] Filenames are lowercase hex: `<TEX0 hash>-<bits %08x>.png`, optionally with a CLUT hash
+  (`<tex0>-<clut>-<bits>`) and/or a region (`-r<w>x<h>`). Mip dumps add `-mip<N>`; the replacement
+  parser requires the extension right after the bits field, so `-mipN` files are not loaded as
+  replacements.
+- RRL treats the whole dump basename as the identifier and copies edited PNGs byte for byte.
+- [M] Replacement images may be any size; RRL conservatively requires a uniform integer enlargement.
+- A live emulator load is not yet verified.

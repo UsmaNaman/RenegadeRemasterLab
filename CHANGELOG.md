@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0a2] - 2026-11-19
+
+### Added
+
+- `rrl normals fix` restores unit-length normal maps after upscaling or editing;
+  `rrl normals from-height` generates tangent-space normal maps from height or luminance.
+- `rrl pack pcsx2` builds a PCSX2 texture replacement folder from a dump and edited PNGs
+  (PS2 groundwork; not yet tested in the emulator).
+- `rrl upscale --pngs IN OUT` upscales a plain PNG folder without a registered source.
+- `scripts/publish.py` publishes audited, squashed updates with a no-reply identity;
+  `scripts/release_audit.py` gains `--ref`, `--since` and `--publish`.
+- Opt-in `.githooks/pre-push` identity guard.
+
 ## [0.1.0a1] - 2026-11-19
 
 First public alpha.

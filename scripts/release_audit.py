@@ -8,6 +8,7 @@ Exit 0 for clean history, 1 for findings, or 2 if the scan could not finish.
 
 from __future__ import annotations
 
+import argparse
 import functools
 import itertools
 import json
@@ -42,15 +43,27 @@ def git(*args: str) -> bytes:
     return subprocess.check_output([*GIT, *args])
 
 
-def text_hits(lines: Iterable[bytes]) -> Iterable[Hit]:
+def allowed_email(match: bytes) -> bool:
+    # Public no-reply identities: GitHub users, and the Co-Authored-By trailer on agent commits.
+    return match in (b"you@example.com", b"noreply@anthropic.com") or match.endswith(
+        b"@users.noreply.github.com"
+    )
+
+
+def text_hits(lines: Iterable[bytes], publish: bool = False, patch: bool = False) -> Iterable[Hit]:
     for number, line in enumerate(lines, 1):
         for category, rule in RULES.items():
-            if rule.search(line):
+            if publish and category == "email":
+                if patch and line.startswith(b"From:"):
+                    continue
+                if any(not allowed_email(m[0]) for m in rule.finditer(line)):
+                    yield category, number
+            elif rule.search(line):
                 yield category, number
 
 
 @functools.cache
-def blob_hits(oid: str, tim: bool) -> list[Hit]:
+def blob_hits(oid: str, tim: bool, publish: bool, patch: bool) -> list[Hit]:
     size = int(git("cat-file", "-s", oid))
     with subprocess.Popen([*GIT, "cat-file", "blob", oid], stdout=subprocess.PIPE) as proc:
         assert proc.stdout is not None
@@ -75,25 +88,41 @@ def blob_hits(oid: str, tim: bool) -> list[Hit]:
         # Keep the line crossing the prefix boundary intact.
         first, sep, tail = head.rpartition(b"\n")
         if sep:
-            hits.extend(text_hits(first.split(b"\n")))
+            hits.extend(text_hits(first.split(b"\n"), publish, patch))
         offset = head.count(b"\n")
 
         lines = itertools.chain([tail + proc.stdout.readline()], proc.stdout)
-        hits.extend((kind, offset + n) for kind, n in text_hits(lines) if n is not None)
+        hits.extend(
+            (kind, offset + n) for kind, n in text_hits(lines, publish, patch) if n is not None
+        )
         if proc.wait():
             raise RuntimeError("could not finish reading a Git blob")
         return hits
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ref", help="audit only commits reachable from this ref")
+    parser.add_argument("--publish", action="store_true", help="apply the public email exceptions")
+    parser.add_argument("--since", help="skip commits reachable from this (already public) ref")
+    args = parser.parse_args()
     refs = ["--all"]
-    if (
+    if args.ref:
+        refs = [
+            git("rev-parse", "--verify", "--end-of-options", args.ref + "^{commit}")
+            .decode()
+            .strip()
+        ]
+    elif (
         subprocess.run(
             [*GIT, "rev-parse", "--verify", "--quiet", "HEAD"], stdout=subprocess.DEVNULL
         ).returncode
         == 0
     ):
         refs.append("HEAD")
+    if args.since:
+        since = git("rev-parse", "--verify", "--end-of-options", args.since + "^{commit}")
+        refs.append("^" + since.decode().strip())
     found = False
     print("finding\tcommit\tpath\tline")
     for raw in git("rev-list", *refs).splitlines():
@@ -105,18 +134,23 @@ def main() -> int:
                 found = True
                 print(category, commit, json.dumps(path), line or "-", sep="\t")
 
-        report("<commit>", text_hits(git("cat-file", "commit", commit).split(b"\n")))
+        report("<commit>", text_hits(git("cat-file", "commit", commit).split(b"\n"), args.publish))
         for record in git("ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
             if not record:
                 continue
             metadata, path = record.split(b"\t", 1)
             _, kind, oid = metadata.split()
             name = path.decode("utf-8", "surrogateescape")
-            report(name, ((k, None) for k, _ in text_hits([path])))
+            report(name, ((k, None) for k, _ in text_hits([path], args.publish)))
             if kind == b"blob":
                 report(
                     name,
-                    blob_hits(oid.decode("ascii"), PurePosixPath(name).suffix.lower() == ".tim"),
+                    blob_hits(
+                        oid.decode("ascii"),
+                        PurePosixPath(name).suffix.lower() == ".tim",
+                        args.publish,
+                        name.startswith("patches/xemu/"),
+                    ),
                 )
     return int(found)
 

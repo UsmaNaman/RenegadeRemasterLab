@@ -39,3 +39,52 @@ It needs at least two complete timestamps spanning a positive duration.
 `schema_version`, `window_s` and a `reports` array in command-line order. Each report
 includes summary values, `windows` and `hitches`. Time fields ending in `_s` use seconds
 and those ending in `_ms` use milliseconds. An empty window has `"worst_ms": null`.
+
+## Prepare normal maps for Blender
+
+Use a PNG-only input tree and a separate output directory. Relative paths are preserved.
+Identical generated files keep their timestamps. Changed maps replace their previous output atomically.
+
+```sh
+uv run rrl normals fix edited-normals fixed-normals
+uv run rrl normals from-height height-maps generated-normals --strength 2.0 --wrap
+```
+
+`fix` restores unit length after external editing or upscaling. RGB and RGBA encode XYZ
+on the outward hemisphere. Negative Z is clamped to zero and RGBA keeps its alpha.
+For a two-channel grayscale-plus-alpha PNG, the two channels encode X and Y. RRL
+reconstructs positive Z and writes RGB.
+
+`from-height` uses normalized luminance and a Sobel derivative per input pixel. Strength
+scales the slope. Edges clamp by default. Use `--wrap` for a tiling height map.
+The result uses OpenGL tangent space (+Y up). In Blender, set the Image Texture to
+**Non-Color**, connect its Color to a **Normal Map** node set to **Tangent Space**,
+and connect that node's Normal output to the shader's Normal input.
+
+## Build a PCSX2 texture pack
+
+1. In PCSX2, enable texture dumping and play the scenes you want to edit. Keep the
+   original dump folder. Use the game serial shown by PCSX2 (for example, `SLUS-12345`).
+2. Edit copies of the dumped PNGs or run the folder upscaler. It uses the same backend,
+   alpha handling, model and side-length settings as source-based upscaling.
+
+   ```sh
+   uv run rrl upscale --pngs dump edited --scale 4 --model realesrgan-x4plus --max-side 4096
+   ```
+
+3. Point the pack command at the flat dump and edited folders. Use the PCSX2 data
+   directory as the pack root, or build into an empty staging directory and copy its
+   `textures` tree into the PCSX2 data directory.
+
+   ```sh
+   uv run rrl pack pcsx2 dump edited my-pack --serial SLUS-12345
+   ```
+
+   This copies matching PNGs to `my-pack/textures/SLUS-12345/replacements/`. Keep
+   the exact dumped filenames. Images may be native size or uniformly enlarged by
+   an integer factor. The JSON report names missing edits, extra edits and incompatible
+   sizes. Each matching replacement is updated individually. Existing unrelated files
+   are retained, so use an empty staging directory for a pack containing only this run.
+   RRL writes PNG only.
+4. Disable dumping, enable **Load Textures** in PCSX2's texture replacement settings
+   and revisit the scene.

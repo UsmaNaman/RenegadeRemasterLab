@@ -1,6 +1,6 @@
 [project]
 name = "renegade-remaster-lab"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Preserve, enhance and reimagine video games you legally own."
 readme = "README.md"
 license = "GPL-3.0-or-later"

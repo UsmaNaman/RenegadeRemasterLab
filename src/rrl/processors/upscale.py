@@ -197,6 +197,49 @@ def _record(
         )
 
 
+def _texture(path: Path, scale: int, max_side: int) -> Texture:
+    with Image.open(path, formats=["PNG"]) as png:
+        factor = 2 if max(png.size) * scale > max_side else scale
+    return Texture(path, factor)
+
+
+def upscale_folder(
+    conn: sqlite3.Connection,
+    store: Path,
+    source: Path,
+    out: Path,
+    backend: Path,
+    model: str,
+    scale: int,
+    max_side: int,
+) -> int:
+    """Enhance ordinary PNGs without a registered source or extraction records."""
+    source, out = source.resolve(), out.resolve()
+    if not source.is_dir():
+        raise ValueError(f"PNG directory does not exist: {source}")
+    if source.is_relative_to(out) or out.is_relative_to(source):
+        raise ValueError("PNG input and output directories must not overlap")
+    if max_side <= 0:
+        raise ValueError("--max-side must be positive")
+    textures = []
+    for path in sorted(source.rglob("*")):
+        if path.suffix.lower() != ".png":
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"expected a regular PNG file: {path}")
+        textures.append(_texture(path, scale, max_side))
+    if not textures:
+        raise ValueError(f"no PNG files in {source}")
+    out.mkdir(parents=True, exist_ok=True)
+    for batch in batched(textures, 200):
+        for texture, data in zip(batch, upscale_batch(backend, model, batch, out), strict=True):
+            name = texture.path.relative_to(source).as_posix()
+            dest = _inside(out, name)
+            sha = put_bytes(conn, store, data, "image/png")
+            _publish(blob_path(store, sha), dest, sha)
+    return len(textures)
+
+
 def upscale_export(
     conn: sqlite3.Connection,
     store: Path,
@@ -247,12 +290,12 @@ def upscale_export(
     pending: list[Texture] = []
     for sha in groups:
         original = blob_path(store, sha)
-        with Image.open(original, formats=["PNG"]) as png:
-            factor = 2 if max(png.size) * scale > max_side else scale
+        texture = _texture(original, scale, max_side)
+        factor = texture.scale
         if result := cached.get((sha, factor)):
             mirror(sha, factor, result)
         else:
-            pending.append(Texture(original, factor))
+            pending.append(texture)
 
     for batch in batched(pending, 200):
         for texture, data in zip(batch, upscale_batch(backend, model, batch, out), strict=True):

@@ -55,3 +55,15 @@ my_adapter = "my_package.adapter:MyAdapter"
 ```
 
 `tests/contract` checks every installed adapter. Test `identify` with synthetic headers only.
+
+## Publishing
+
+Set `git config rrl.publishIdentity 'Your Name <your-id@users.noreply.github.com>'`.
+From a clean checkout, run `python scripts/publish.py --dry-run` to preview the squash and audit.
+Run again with `--message "Release summary"` to prepare the local `release` branch.
+Add `--push` to update public `main`. With `--tag vX.Y.Z`, the script also creates an
+annotated tag and includes that tag in the same push. Keep the private history on this machine.
+
+To enable the tracked identity guard, run `git config core.hooksPath .githooks`. This selects
+that directory for **all** hooks. If you use pre-commit, run `uv run pre-commit run --all-files`
+before committing or arrange for both hooks to run.
